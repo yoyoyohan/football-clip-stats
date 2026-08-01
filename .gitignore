@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Model weights (too large for git — see models/README.md)
+*.pt
+*.onnx
+*.engine
+bestmodel/
+
+# Videos & media
+*.mp4
+*.mov
+*.avi
+*.mkv
+runs/
+input_videos/*
+!input_videos/.gitkeep
+output_videos/*
+!output_videos/.gitkeep
+
+# Caches / generated
+*.pkl
+*.npy
+
+# Large training datasets (keep scripts/docs only)
+training/soccer-players-1/
+training/labels/
+models/event_classifiers/
+
+# Local calibration can stay; ignore accidental dumps
+calibration/*.bak
