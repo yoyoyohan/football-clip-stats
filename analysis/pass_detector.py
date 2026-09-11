@@ -150,19 +150,28 @@ class PassDetector:
         if last.from_track_id != to_tid or last.to_track_id != from_tid:
             return False
 
-        gap_secs = (frame_idx - last.frame) / self.fps
+        gap_frames = frame_idx - last.frame
+        gap_secs = gap_frames / self.fps
         if gap_secs >= self.return_window_frames / REF_FPS:
-            return False
-
-        # Confirmed ball flight → treat as a real return pass / give-and-go.
-        if self._in_flight and (
-            self._peak_speed >= self.min_velocity_peak or self._flight_observations >= 1
-        ):
             return False
 
         travel = 0.0
         if self._ball_at_release is not None and self._last_pass_ball is not None:
             travel = _dist(self._last_pass_ball, self._ball_at_release)
+
+        # Near-instant tiny returns are almost always tracking noise.
+        if gap_frames <= self._frames(8) and travel < self._px(self.min_ball_travel * 0.5):
+            return True
+
+        # Confirmed ball flight with meaningful travel → real give-and-go.
+        if self._in_flight and (
+            self._peak_speed >= self.min_velocity_peak or self._flight_observations >= 1
+        ):
+            if travel >= self._px(self.min_ball_travel * 0.5):
+                return False
+            # Flight claimed but ball barely moved: still treat as bounce-back noise.
+            return True
+
         if travel >= self._px(self.min_ball_travel * 0.5):
             return False
 
@@ -276,7 +285,8 @@ class PassDetector:
             return None
         if self._peak_speed < self.min_velocity_peak:
             return None
-        if self._flight_observations < 1 and self._peak_speed < self.long_pass_peak:
+        # Require at least one observed in-flight frame (blocks interpolated FPs).
+        if self._flight_observations < 1:
             return None
         if self._passer_team is not None and team != self._passer_team:
             return None
@@ -359,9 +369,14 @@ class PassDetector:
             self._control_streak = 0
 
         stable_control = self._frames(self.control_stable_frames)
-        releasing = speed >= self.high_speed or (
+        # Require a clearer release: high speed alone, or moderate speed plus
+        # leaving the last controller's feet. Avoids slow dribble "flights".
+        dist_release = (
             self._last_control_pos is not None
             and _dist(self._last_control_pos, ball) >= self._px(self.release_dist)
+        )
+        releasing = speed >= self.high_speed or (
+            dist_release and speed >= self.min_velocity_peak * 0.5
         )
         if releasing and (controller is None or self._control_streak < stable_control):
             self._begin_flight(frame_idx, ball)
