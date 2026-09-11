@@ -17,6 +17,11 @@ venv/
 *.onnx
 *.engine
 bestmodel/
+newbest/
+
+# Local fine-tune dumps / archives
+finetuned/
+*.zip
 
 # Videos & media
 *.mp4
