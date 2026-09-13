@@ -600,6 +600,7 @@ class StatEngine:
             self._possessor_track_id,
             self._possessor_team,
             ball_observed=ball_observed,
+            players=players,
         )
         self._update_ball_events(frame_idx, ball)
         self._update_tackles(frame_idx, players, ball)

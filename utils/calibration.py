@@ -161,9 +161,10 @@ def _estimate_depth_pixel(
     perp = np.array([-along_goal[1], along_goal[0]], dtype=np.float64)
     if perp[1] > 0:
         perp = -perp
+    perp = perp / float(np.linalg.norm(perp))
 
     depth_m = 11.0 if depth_type == "penalty_spot" else PENALTY_DEPTH_M
-    scale = goal_len / GOAL_WIDTH_M
+    scale = goal_len / GOAL_WIDTH_M  # pixels per meter along the goal line
     depth_px = center + perp * (depth_m * scale)
     return (float(depth_px[0]), float(depth_px[1]))
 
@@ -341,20 +342,518 @@ def auto_calibration_from_goalposts(
     frame_width: int,
     frame_height: int,
 ) -> dict | None:
-    H = estimate_homography_from_goalposts(goalposts, frame_width)
-    if H is None:
+    """Single-frame auto calibration (legacy). Prefer robust_auto_calibration_from_frames."""
+    if len(goalposts) < 2:
         return None
-    return {
-        "homography": H.tolist(),
-        "goal_boxes": {
-            "team0": goal_box_from_homography(H, "team0"),
-            "team1": goal_box_from_homography(H, "team1"),
-        },
-        "field_polygon": field_polygon_from_homography(H),
-        "pitch_meters": {"length": PITCH_LENGTH_M, "width": PITCH_WIDTH_M},
-        "method": "goalpost_auto",
-        "frame_size": {"width": frame_width, "height": frame_height},
-    }
+
+    feet = sorted((_post_foot(g) for g in goalposts), key=lambda p: p[0])
+    mid = frame_width / 2.0
+    left_feet = [f for f in feet if f[0] < mid]
+    right_feet = [f for f in feet if f[0] >= mid]
+
+    # Prefer dual-goal with depth augmentation when both sides have ≥2 posts.
+    if len(left_feet) >= 2 and len(right_feet) >= 2:
+        src_px = [left_feet[0], left_feet[-1], right_feet[0], right_feet[-1]]
+        dst_m = [
+            LANDMARK_CATALOG["left_goal_left_post"],
+            LANDMARK_CATALOG["left_goal_right_post"],
+            LANDMARK_CATALOG["right_goal_left_post"],
+            LANDMARK_CATALOG["right_goal_right_post"],
+        ]
+        src_aug = list(src_px)
+        dst_aug = list(dst_m)
+        for side, a, b in (("left", src_px[0], src_px[1]), ("right", src_px[2], src_px[3])):
+            try:
+                depth_px = _estimate_depth_pixel(
+                    np.array(a, dtype=np.float64),
+                    np.array(b, dtype=np.float64),
+                    side,
+                    "penalty_spot",
+                )
+                src_aug.append(depth_px)
+                dst_aug.append(_depth_meter_point(side, "penalty_spot"))
+            except ValueError:
+                pass
+        H, _ = cv2.findHomography(np.float32(src_aug), np.float32(dst_aug), cv2.RANSAC, 5.0)
+        if H is not None:
+            cal = {
+                "homography": H.tolist(),
+                "goal_boxes": {
+                    "team0": goal_box_from_homography(H, "team0"),
+                    "team1": goal_box_from_homography(H, "team1"),
+                },
+                "field_polygon": field_polygon_from_homography(H),
+                "pitch_meters": {"length": PITCH_LENGTH_M, "width": PITCH_WIDTH_M},
+                "method": "goalpost_auto",
+                "goal_on_screen": "both",
+                "frame_size": {"width": frame_width, "height": frame_height},
+                "quality": 0.45,
+                "quality_notes": ["single_frame_four_post"],
+                "post_feet_px": {
+                    "left_goal_left": list(src_px[0]),
+                    "left_goal_right": list(src_px[1]),
+                    "right_goal_left": list(src_px[2]),
+                    "right_goal_right": list(src_px[3]),
+                },
+                "depth_estimated": True,
+            }
+            return cal if _calibration_passes_sanity(cal, frame_width, frame_height) else None
+
+    # Single goal (2+ posts on one side, or overall).
+    post_a, post_b = feet[0], feet[-1]
+    if abs(post_b[0] - post_a[0]) < max(20.0, frame_width * 0.015):
+        return None
+    mid_x = (post_a[0] + post_b[0]) / 2.0
+    goal_on_screen = "left" if mid_x < frame_width / 2.0 else "right"
+    try:
+        cal = build_calibration_from_one_goal(post_a, post_b, goal_on_screen)
+    except ValueError:
+        return None
+    cal["method"] = "goalpost_auto"
+    cal["frame_size"] = {"width": frame_width, "height": frame_height}
+    cal["quality"] = 0.35
+    cal["quality_notes"] = ["single_frame_two_post_fallback"]
+    cal["post_feet_px"] = {"post_left": list(post_a), "post_right": list(post_b)}
+    return cal if _calibration_passes_sanity(cal, frame_width, frame_height) else None
+
+
+def _post_foot(post: dict) -> tuple[float, float]:
+    """Ground contact approximation: bottom-center of the goalpost bbox."""
+    bbox = post["bbox"]
+    return (float(bbox[0] + bbox[2]) / 2.0, float(bbox[3]))
+
+
+def _extract_goalposts_from_record(record: dict) -> list[dict]:
+    overlay = record.get("overlay") or {}
+    posts = overlay.get("goalposts")
+    if posts:
+        return list(posts)
+    detections = record.get("detections") or []
+    return [d for d in detections if d.get("class_name") == "goalpost"]
+
+
+def _median_xy(points: list[tuple[float, float]]) -> tuple[float, float]:
+    xs = sorted(p[0] for p in points)
+    ys = sorted(p[1] for p in points)
+    n = len(points)
+    mid = n // 2
+    if n % 2:
+        return (xs[mid], ys[mid])
+    return ((xs[mid - 1] + xs[mid]) / 2.0, (ys[mid - 1] + ys[mid]) / 2.0)
+
+
+def _cluster_feet_by_x(
+    feet: list[tuple[float, float]],
+    max_clusters: int = 4,
+    gap_frac: float = 0.04,
+    frame_width: int = 1280,
+) -> list[list[tuple[float, float]]]:
+    """Greedy 1-D gap clustering on foot x (stable posts across frames)."""
+    if not feet:
+        return []
+    ordered = sorted(feet, key=lambda p: p[0])
+    min_gap = max(18.0, frame_width * gap_frac)
+    clusters: list[list[tuple[float, float]]] = [[ordered[0]]]
+    for pt in ordered[1:]:
+        if pt[0] - clusters[-1][-1][0] >= min_gap:
+            clusters.append([pt])
+        else:
+            clusters[-1].append(pt)
+    # Merge smallest gaps until <= max_clusters
+    while len(clusters) > max_clusters:
+        gaps = [
+            (clusters[i + 1][0][0] - clusters[i][-1][0], i)
+            for i in range(len(clusters) - 1)
+        ]
+        _, idx = min(gaps, key=lambda t: t[0])
+        clusters[idx].extend(clusters[idx + 1])
+        del clusters[idx + 1]
+    return clusters
+
+
+def _infer_goal_side(
+    post_left: tuple[float, float],
+    post_right: tuple[float, float],
+    frame_width: int,
+) -> str:
+    mid_x = (post_left[0] + post_right[0]) / 2.0
+    return "left" if mid_x < frame_width / 2.0 else "right"
+
+
+def _pixels_to_meters(homography: np.ndarray, points_px: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points_px, dtype=np.float32).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(pts, homography).reshape(-1, 2)
+
+
+def _calibration_passes_sanity(
+    cal: dict,
+    frame_width: int,
+    frame_height: int,
+    *,
+    margin_m: float = 25.0,
+) -> bool:
+    """Reject clearly degenerate or explosive homographies."""
+    try:
+        H = np.asarray(cal["homography"], dtype=np.float64)
+        if H.shape != (3, 3) or not np.isfinite(H).all():
+            return False
+        det = float(np.linalg.det(H))
+        if abs(det) < 1e-12:
+            return False
+
+        # Prefer checking known post feet when present.
+        feet: list[tuple[float, float]] = []
+        post_feet = cal.get("post_feet_px") or {}
+        for key in (
+            "post_left", "post_right",
+            "left_goal_left", "left_goal_right",
+            "right_goal_left", "right_goal_right",
+        ):
+            if key in post_feet:
+                feet.append(tuple(post_feet[key]))
+        if len(feet) >= 2:
+            meters = _pixels_to_meters(H, np.float32(feet))
+            if not np.isfinite(meters).all():
+                return False
+            # Posts should land near a goal line (x≈0 or x≈105) and within pitch y.
+            near_left = np.abs(meters[:, 0] - 0.0) < margin_m
+            near_right = np.abs(meters[:, 0] - PITCH_LENGTH_M) < margin_m
+            y_ok = (meters[:, 1] >= -margin_m) & (meters[:, 1] <= PITCH_WIDTH_M + margin_m)
+            if not bool(np.all(y_ok)):
+                return False
+            if not bool(np.all(near_left | near_right)):
+                return False
+            # Separation in meters should resemble a real goal width (or two goals).
+            # For a single pair, y-span should be near GOAL_WIDTH_M.
+            if len(feet) == 2:
+                y_span = float(abs(meters[0, 1] - meters[1, 1]))
+                if y_span < GOAL_WIDTH_M * 0.35 or y_span > GOAL_WIDTH_M * 2.5:
+                    return False
+            return True
+
+        # Fallback: lower-third samples should not all explode outside the pitch.
+        samples = np.float32([
+            [frame_width * 0.30, frame_height * 0.70],
+            [frame_width * 0.50, frame_height * 0.72],
+            [frame_width * 0.70, frame_height * 0.70],
+        ])
+        meters = _pixels_to_meters(H, samples)
+        if not np.isfinite(meters).all():
+            return False
+        inside = (
+            (meters[:, 0] >= -margin_m * 2)
+            & (meters[:, 0] <= PITCH_LENGTH_M + margin_m * 2)
+            & (meters[:, 1] >= -margin_m * 2)
+            & (meters[:, 1] <= PITCH_WIDTH_M + margin_m * 2)
+        )
+        if int(inside.sum()) < 1:
+            return False
+        span_x = float(meters[:, 0].max() - meters[:, 0].min())
+        span_y = float(meters[:, 1].max() - meters[:, 1].min())
+        if span_x + span_y < 3.0:
+            return False
+        if span_x > PITCH_LENGTH_M * 3.0 or span_y > PITCH_WIDTH_M * 3.0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _reprojection_score(
+    H: np.ndarray,
+    pixel_points: list[tuple[float, float]],
+    meter_points: list[tuple[float, float]],
+) -> float:
+    """1.0 = perfect; decays with mean pixel reprojection error."""
+    if len(pixel_points) < 2:
+        return 0.0
+    pred = meters_to_pixels(H, np.float32(meter_points))
+    err = np.linalg.norm(pred - np.float32(pixel_points), axis=1)
+    mean_err = float(np.mean(err))
+    return float(max(0.0, 1.0 - mean_err / 40.0))
+
+
+def _score_post_separation(
+    sep_px: float,
+    frame_width: int,
+    min_sep: float,
+    max_sep: float,
+) -> float:
+    if sep_px < min_sep or sep_px > max_sep:
+        return 0.0
+    # Prefer separations that look like a real goal width in broadcast (~3–12% of width).
+    ideal = frame_width * 0.07
+    return float(max(0.0, 1.0 - abs(sep_px - ideal) / (ideal * 2.5)))
+
+
+MANUAL_CALIBRATION_METHODS = frozenset({
+    "single_goal",
+    "landmarks",
+    "corners",
+    "manual",
+})
+AUTO_CALIBRATION_METHODS = frozenset({
+    "goalpost_auto",
+    "goalpost_auto_multiframe",
+})
+
+
+def is_manual_calibration(method: str | None) -> bool:
+    if not method:
+        # Legacy files without method are treated as user-provided.
+        return True
+    return method in MANUAL_CALIBRATION_METHODS
+
+
+def is_auto_calibration(method: str | None) -> bool:
+    return bool(method) and (
+        method in AUTO_CALIBRATION_METHODS or str(method).startswith("goalpost_auto")
+    )
+
+
+def robust_auto_calibration_from_frames(
+    frame_records: list[dict],
+    frame_width: int,
+    frame_height: int,
+    *,
+    min_samples_per_post: int = 3,
+    min_post_separation_px: float | None = None,
+    max_post_separation_px: float | None = None,
+) -> dict | None:
+    """
+    Multi-frame automatic pitch calibration from YOLO goalpost detections.
+
+    Aggregates stable left/right post feet across frames (median), infers goal
+    side, builds a homography, and quality-gates the result. Returns None if
+    detections are insufficient or the homography fails sanity checks.
+    """
+    if not frame_records:
+        return None
+
+    min_sep = min_post_separation_px if min_post_separation_px is not None else max(20.0, frame_width * 0.015)
+    max_sep = max_post_separation_px if max_post_separation_px is not None else frame_width * 0.45
+
+    # Per-frame post feet (sorted left→right).
+    frame_feet: list[list[tuple[float, float]]] = []
+    all_feet: list[tuple[float, float]] = []
+    for record in frame_records:
+        posts = _extract_goalposts_from_record(record)
+        if len(posts) < 2:
+            continue
+        feet = sorted((_post_foot(p) for p in posts), key=lambda p: p[0])
+        # Deduplicate near-identical detections in one frame.
+        deduped: list[tuple[float, float]] = [feet[0]]
+        for ft in feet[1:]:
+            if abs(ft[0] - deduped[-1][0]) >= min_sep * 0.5:
+                deduped.append(ft)
+        if len(deduped) < 2:
+            continue
+        frame_feet.append(deduped)
+        all_feet.extend(deduped)
+
+    if len(frame_feet) < min_samples_per_post and len(all_feet) < min_samples_per_post * 2:
+        # Last-ditch: try any single frame with the legacy path (still enforce separation).
+        for record in frame_records:
+            posts = _extract_goalposts_from_record(record)
+            if len(posts) < 2:
+                continue
+            feet = sorted((_post_foot(p) for p in posts), key=lambda p: p[0])
+            if abs(feet[-1][0] - feet[0][0]) < min_sep:
+                continue
+            cal = auto_calibration_from_goalposts(posts, frame_width, frame_height)
+            if cal is not None:
+                cal["method"] = "goalpost_auto"
+                cal["quality"] = min(float(cal.get("quality", 0.3)), 0.4)
+                notes = list(cal.get("quality_notes") or [])
+                notes.append("sparse_frames_legacy_fallback")
+                cal["quality_notes"] = notes
+                return cal
+        return None
+
+    clusters = _cluster_feet_by_x(all_feet, max_clusters=4, frame_width=frame_width)
+    # Keep clusters with enough support.
+    strong = [c for c in clusters if len(c) >= min_samples_per_post]
+    notes: list[str] = []
+    cal: dict | None = None
+    quality = 0.0
+
+    if len(strong) >= 4:
+        # Two goals visible — use outermost pair on each side of mid-frame.
+        medians = [_median_xy(c) for c in strong]
+        left_side = sorted([m for m in medians if m[0] < frame_width / 2.0], key=lambda p: p[0])
+        right_side = sorted([m for m in medians if m[0] >= frame_width / 2.0], key=lambda p: p[0])
+        if len(left_side) >= 2 and len(right_side) >= 2:
+            src_px = [left_side[0], left_side[-1], right_side[0], right_side[-1]]
+            dst_m = [
+                LANDMARK_CATALOG["left_goal_left_post"],
+                LANDMARK_CATALOG["left_goal_right_post"],
+                LANDMARK_CATALOG["right_goal_left_post"],
+                LANDMARK_CATALOG["right_goal_right_post"],
+            ]
+            sep_l = abs(src_px[1][0] - src_px[0][0])
+            sep_r = abs(src_px[3][0] - src_px[2][0])
+            if sep_l < min_sep or sep_r < min_sep or sep_l > max_sep or sep_r > max_sep:
+                notes.append("both_goals_implausible_separation")
+            else:
+                # Augment each goal with an estimated depth point so H is not
+                # under-constrained (goal-line-only correspondences are weak).
+                src_aug = list(src_px)
+                dst_aug = list(dst_m)
+                for side, a, b in (
+                    ("left", src_px[0], src_px[1]),
+                    ("right", src_px[2], src_px[3]),
+                ):
+                    try:
+                        depth_px = _estimate_depth_pixel(
+                            np.array(a, dtype=np.float64),
+                            np.array(b, dtype=np.float64),
+                            side,
+                            "penalty_spot",
+                        )
+                    except ValueError:
+                        continue
+                    src_aug.append(depth_px)
+                    dst_aug.append(_depth_meter_point(side, "penalty_spot"))
+                H, _ = cv2.findHomography(
+                    np.float32(src_aug), np.float32(dst_aug), cv2.RANSAC, 5.0
+                )
+                if H is not None:
+                    repro = _reprojection_score(H, src_px, dst_m)
+                    sep_score = 0.5 * (
+                        _score_post_separation(sep_l, frame_width, min_sep, max_sep)
+                        + _score_post_separation(sep_r, frame_width, min_sep, max_sep)
+                    )
+                    sample_score = min(1.0, len(frame_feet) / 20.0)
+                    quality = 0.45 * repro + 0.30 * sep_score + 0.25 * sample_score
+                    cal = {
+                        "homography": H.tolist(),
+                        "goal_boxes": {
+                            "team0": goal_box_from_homography(H, "team0"),
+                            "team1": goal_box_from_homography(H, "team1"),
+                        },
+                        "field_polygon": field_polygon_from_homography(H),
+                        "pitch_meters": {"length": PITCH_LENGTH_M, "width": PITCH_WIDTH_M},
+                        "method": "goalpost_auto_multiframe",
+                        "goal_on_screen": "both",
+                        "frame_size": {"width": frame_width, "height": frame_height},
+                        "quality": float(quality),
+                        "post_feet_px": {
+                            "left_goal_left": list(src_px[0]),
+                            "left_goal_right": list(src_px[1]),
+                            "right_goal_left": list(src_px[2]),
+                            "right_goal_right": list(src_px[3]),
+                        },
+                        "samples_frames": len(frame_feet),
+                        "depth_estimated": True,
+                    }
+                    notes.append("both_goals_aggregated")
+
+    if cal is None and len(strong) >= 2:
+        # Single goal: take the two strongest neighboring clusters.
+        # Prefer the pair with the most combined samples and plausible separation.
+        candidates: list[tuple[float, tuple[float, float], tuple[float, float], int, int]] = []
+        med_with_n = [(_median_xy(c), len(c)) for c in strong]
+        for i in range(len(med_with_n) - 1):
+            for j in range(i + 1, len(med_with_n)):
+                a, na = med_with_n[i]
+                b, nb = med_with_n[j]
+                if a[0] > b[0]:
+                    a, b = b, a
+                    na, nb = nb, na
+                sep = b[0] - a[0]
+                if sep < min_sep or sep > max_sep:
+                    continue
+                score = na + nb + _score_post_separation(sep, frame_width, min_sep, max_sep) * 10.0
+                candidates.append((score, a, b, na, nb))
+        if candidates:
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            _, post_l, post_r, n_l, n_r = candidates[0]
+            goal_on_screen = _infer_goal_side(post_l, post_r, frame_width)
+            try:
+                built = build_calibration_from_one_goal(post_l, post_r, goal_on_screen)
+            except ValueError:
+                built = None
+            if built is not None:
+                H = np.asarray(built["homography"], dtype=np.float64)
+                meter_posts = list(_goal_post_meter_coords(goal_on_screen))
+                repro = _reprojection_score(H, [post_l, post_r], meter_posts)
+                sep = abs(post_r[0] - post_l[0])
+                sep_score = _score_post_separation(sep, frame_width, min_sep, max_sep)
+                sample_score = min(1.0, (n_l + n_r) / 30.0)
+                quality = 0.40 * repro + 0.35 * sep_score + 0.25 * sample_score
+                # Depth was estimated — slightly lower confidence.
+                if built.get("depth_estimated"):
+                    quality *= 0.9
+                    notes.append("depth_estimated_from_goal_width")
+                built["method"] = "goalpost_auto_multiframe"
+                built["frame_size"] = {"width": frame_width, "height": frame_height}
+                built["quality"] = float(quality)
+                built["post_feet_px"] = {
+                    "post_left": list(post_l),
+                    "post_right": list(post_r),
+                }
+                built["samples_per_post"] = {"left": int(n_l), "right": int(n_r)}
+                built["samples_frames"] = len(frame_feet)
+                notes.append(f"single_goal_{goal_on_screen}")
+                cal = built
+
+    if cal is None:
+        # Pair-wise median from frames that show exactly two posts (very common TV shot).
+        left_feet: list[tuple[float, float]] = []
+        right_feet: list[tuple[float, float]] = []
+        for feet in frame_feet:
+            if len(feet) == 2:
+                left_feet.append(feet[0])
+                right_feet.append(feet[1])
+            elif len(feet) > 2:
+                # Use outermost two if they are close enough to be one goal.
+                if feet[-1][0] - feet[0][0] <= max_sep:
+                    left_feet.append(feet[0])
+                    right_feet.append(feet[-1])
+        if len(left_feet) >= min_samples_per_post and len(right_feet) >= min_samples_per_post:
+            post_l = _median_xy(left_feet)
+            post_r = _median_xy(right_feet)
+            sep = abs(post_r[0] - post_l[0])
+            if min_sep <= sep <= max_sep:
+                goal_on_screen = _infer_goal_side(post_l, post_r, frame_width)
+                try:
+                    built = build_calibration_from_one_goal(post_l, post_r, goal_on_screen)
+                except ValueError:
+                    built = None
+                if built is not None:
+                    H = np.asarray(built["homography"], dtype=np.float64)
+                    meter_posts = list(_goal_post_meter_coords(goal_on_screen))
+                    repro = _reprojection_score(H, [post_l, post_r], meter_posts)
+                    sep_score = _score_post_separation(sep, frame_width, min_sep, max_sep)
+                    sample_score = min(1.0, (len(left_feet) + len(right_feet)) / 30.0)
+                    quality = 0.40 * repro + 0.35 * sep_score + 0.25 * sample_score
+                    if built.get("depth_estimated"):
+                        quality *= 0.9
+                        notes.append("depth_estimated_from_goal_width")
+                    built["method"] = "goalpost_auto_multiframe"
+                    built["frame_size"] = {"width": frame_width, "height": frame_height}
+                    built["quality"] = float(quality)
+                    built["post_feet_px"] = {
+                        "post_left": list(post_l),
+                        "post_right": list(post_r),
+                    }
+                    built["samples_per_post"] = {
+                        "left": len(left_feet),
+                        "right": len(right_feet),
+                    }
+                    built["samples_frames"] = len(frame_feet)
+                    notes.append(f"paired_frames_single_goal_{goal_on_screen}")
+                    cal = built
+
+    if cal is None:
+        return None
+
+    cal["quality_notes"] = notes
+    if float(cal.get("quality", 0.0)) < 0.25:
+        return None
+    if not _calibration_passes_sanity(cal, frame_width, frame_height):
+        return None
+    return cal
 
 
 def build_calibration(
@@ -404,6 +903,9 @@ def load_calibration(
         "goal_boxes": data["goal_boxes"],
         "field_polygon": data["field_polygon"],
         "attacking_direction": data.get("attacking_direction", "left_to_right"),
+        "method": data.get("method"),
+        "quality": data.get("quality"),
+        "raw": data,
     }
     # Only pass through fps if calibration stored it — never invent 30fps.
     if "fps" in data and data["fps"]:

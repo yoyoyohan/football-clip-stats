@@ -5,14 +5,17 @@ Full match-clip stats pipeline (run locally — preferred over Kaggle for iterat
 Video in → YOLO (best.pt) → ByteTrack → team colors → homography pitch coords → stats out.
 
 Usage:
-  # 1. Calibrate pitch once per camera angle (interactive)
-  python calibrate_pitch.py --source input_videos/elclasico.mp4 --frame 50
-
-  # 2. Run full pipeline
+  # Drop a clip and run — pitch auto-calibrates from goalpost detections
   python run_clip.py --source input_videos/elclasico.mp4
 
-  # Force re-detect (after retraining best.pt)
+  # Force re-detect + refresh auto calibration
   python run_clip.py --source input_videos/moroccomatch.mp4 --no-cache
+
+  # Force re-run auto calibration even if a manual JSON exists
+  python run_clip.py --source input_videos/elclasico.mp4 --force-auto-cal
+
+  # Interactive fallback (only if auto-cal fails or you want higher accuracy)
+  python calibrate_pitch.py --source input_videos/elclasico.mp4
 """
 
 from __future__ import annotations
@@ -31,9 +34,11 @@ from stats_engine import StatEngine, default_field_polygon, default_goal_boxes, 
 from trackers import Tracker
 from utils import read_video
 from utils.calibration import (
-    auto_calibration_from_goalposts,
     default_calibration_path,
+    is_auto_calibration,
+    is_manual_calibration,
     load_calibration,
+    robust_auto_calibration_from_frames,
     save_calibration,
 )
 from utils.goal_regions import goal_mouth_lines_from_boxes, refine_goal_boxes_from_frames
@@ -135,6 +140,11 @@ def main():
     parser.add_argument("--source", required=True, help="Path to video clip")
     parser.add_argument("--model", default="models/best.pt")
     parser.add_argument("--no-cache", action="store_true", help="Re-run YOLO+tracking")
+    parser.add_argument(
+        "--force-auto-cal",
+        action="store_true",
+        help="Recompute automatic pitch calibration even if a manual JSON exists",
+    )
     parser.add_argument("--team0-name", default="team0")
     parser.add_argument("--team1-name", default="team1")
     args = parser.parse_args()
@@ -184,8 +194,50 @@ def main():
 
     cal_path = default_calibration_path(str(video_path))
     cal = load_calibration(cal_path, w, h)
+    method = cal.get("method") if cal else None
+
+    # Keep manual/landmark/corner JSON unless --force-auto-cal.
+    # Refresh prior auto calibrations when --no-cache or --force-auto-cal.
+    should_auto = False
+    if args.force_auto_cal:
+        should_auto = True
+        print("--force-auto-cal: recomputing automatic pitch calibration")
+    elif cal is None:
+        should_auto = True
+        print(f"No calibration at {cal_path} — running automatic multi-frame calibration")
+    elif is_auto_calibration(method) and args.no_cache:
+        should_auto = True
+        print(f"Refreshing auto calibration ({method}) because --no-cache was set")
+    elif is_manual_calibration(method):
+        print(f"Pitch calibration (manual/{method or 'legacy'}): {cal_path}")
+    else:
+        print(f"Pitch calibration: {cal_path} (method={method})")
+
+    if should_auto:
+        auto = robust_auto_calibration_from_frames(frame_records, w, h)
+        if auto:
+            auto["video"] = str(video_path)
+            auto["fps"] = fps
+            auto["attacking_direction"] = "left_to_right"
+            save_calibration(cal_path, auto)
+            q = auto.get("quality")
+            q_txt = f"{q:.2f}" if isinstance(q, (int, float)) else "?"
+            print(
+                f"Auto-calibrated ({auto.get('method')}, quality={q_txt}) → saved {cal_path}"
+            )
+            if auto.get("quality_notes"):
+                print(f"  notes: {', '.join(auto['quality_notes'])}")
+            cal = load_calibration(cal_path, w, h)
+        else:
+            print("Automatic calibration failed (insufficient / unstable goalposts)")
+            if cal and is_manual_calibration(method) and not args.force_auto_cal:
+                print(f"  → Keeping existing calibration: {cal_path}")
+            elif cal and is_auto_calibration(method) and not args.force_auto_cal:
+                print(f"  → Keeping previous auto calibration: {cal_path}")
+            else:
+                cal = None
+
     if cal:
-        print(f"Pitch calibration: {cal_path}")
         homography = cal["homography"]
         goal_boxes = cal["goal_boxes"]
         field_polygon = cal["field_polygon"]
@@ -193,36 +245,18 @@ def main():
         # Prefer real video FPS; only override if calibration explicitly stored fps.
         if cal.get("fps"):
             fps = float(cal["fps"])
+        if not should_auto:
+            # Already printed path above for keep paths; ensure load message once.
+            pass
     else:
-        print(f"No calibration at {cal_path}")
-        auto = None
-        for rec in frame_records:
-            posts = rec.get("overlay", {}).get("goalposts", [])
-            if len(posts) >= 2:
-                auto = auto_calibration_from_goalposts(posts, w, h)
-                if auto:
-                    auto["video"] = str(video_path)
-                    auto["fps"] = fps
-                    auto["attacking_direction"] = "left_to_right"
-                    save_calibration(cal_path, auto)
-                    print(f"Auto-calibrated from goalposts → saved {cal_path}")
-                    break
-        if auto:
-            cal = load_calibration(cal_path, w, h)
-        if cal:
-            homography = cal["homography"]
-            goal_boxes = cal["goal_boxes"]
-            field_polygon = cal["field_polygon"]
-            attacking_direction = cal["attacking_direction"]
-        else:
-            print("  → Calibrate manually:")
-            print(f"     python calibrate_pitch.py --source {video_path} --mode goal")
-            print(f"     python calibrate_pitch.py --source {video_path} --mode landmarks")
-            print("  → Using default homography (less accurate pitch meters)")
-            homography = default_homography(w, h)
-            goal_boxes = default_goal_boxes(w, h)
-            field_polygon = default_field_polygon(w, h)
-            attacking_direction = "left_to_right"
+        print("  → Interactive fallback:")
+        print(f"     python calibrate_pitch.py --source {video_path} --mode goal")
+        print(f"     python calibrate_pitch.py --source {video_path} --mode landmarks")
+        print("  → Using default homography (less accurate pitch meters)")
+        homography = default_homography(w, h)
+        goal_boxes = default_goal_boxes(w, h)
+        field_polygon = default_field_polygon(w, h)
+        attacking_direction = "left_to_right"
 
     print(f"Video FPS: {fps:.2f}")
 
