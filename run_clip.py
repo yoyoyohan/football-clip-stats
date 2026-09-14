@@ -51,14 +51,18 @@ def export_pitch_tracks(
     assigner: TeamColorAssigner,
     engine: StatEngine,
     ball_interpolator: BallInterpolator,
+    smoothed_ball: list | None = None,
 ):
     """Per-frame player + ball positions in pitch meters (105 x 68)."""
+    from utils.detection_utils import normalize_ball
+
     rows = []
-    for record in frame_records:
+    if smoothed_ball is None:
+        smoothed_ball = ball_interpolator.smooth_frame_records(frame_records)
+    for record, obs in zip(frame_records, smoothed_ball):
         idx = record["frame_idx"]
         frame = video_frames[idx]
         dets = assigner.assign_teams(frame, record["detections"])
-        obs = ball_interpolator.update(idx, record.get("ball"))
         ball_px = obs.position
         ball_m = engine.pitch.to_meters(ball_px) if ball_px else (None, None)
 
@@ -276,11 +280,11 @@ def main():
         frame_height=h,
     )
 
-    bi = BallInterpolator(fps=fps)
-    for rec in frame_records:
+    bi = BallInterpolator(fps=fps, frame_width=w, frame_height=h)
+    smoothed_ball = bi.smooth_frame_records(frame_records)
+    for rec, obs in zip(frame_records, smoothed_ball):
         idx = rec["frame_idx"]
         dets = assigner.assign_teams(video_frames[idx], rec["detections"])
-        obs = bi.update(idx, rec.get("ball"))
         engine.update(idx, dets, obs.position, ball_observed=obs.observed)
 
     stats = engine.get_stats()
@@ -298,7 +302,9 @@ def main():
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
     engine.export_csv(str(csv_path))
-    export_pitch_tracks(tracks_path, frame_records, video_frames, assigner, engine, bi)
+    export_pitch_tracks(
+        tracks_path, frame_records, video_frames, assigner, engine, bi, smoothed_ball=smoothed_ball
+    )
 
     print(f"\nWrote:\n  {stats_path}\n  {csv_path}\n  {tracks_path}")
     print_summary(stats, fps)
