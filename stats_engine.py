@@ -600,6 +600,7 @@ class StatEngine:
             self._possessor_track_id,
             self._possessor_team,
             ball_observed=ball_observed,
+            players=players,
         )
         self._update_ball_events(frame_idx, ball)
         self._update_tackles(frame_idx, players, ball)
@@ -830,7 +831,7 @@ def run_pipeline_on_video(
 
     tracker = Tracker(model_path)
     color_assigner = TeamColorAssigner()
-    ball_interpolator = BallInterpolator(fps=25)
+    ball_interpolator = BallInterpolator(fps=25, frame_width=w, frame_height=h)
     camera_estimator = CameraMovementEstimator()
 
     engine = StatEngine(
@@ -850,7 +851,9 @@ def run_pipeline_on_video(
         frame = record["frame"]
         camera_estimator.estimate(frame)
         detections = color_assigner.assign_teams(frame, record["detections"])
-        ball_obs = ball_interpolator.update(idx, record["ball"])
+        from utils.detection_utils import normalize_ball
+        pos, conf, _ = normalize_ball(record.get("ball"))
+        ball_obs = ball_interpolator.update(idx, pos, confidence=conf)
         engine.update(idx, detections, ball_obs.position, ball_observed=ball_obs.observed)
         if idx > 0 and idx % StatEngine.FORMATION_INTERVAL == 0:
             stats = engine.get_stats()
@@ -914,12 +917,15 @@ def main():
             frame_height=h,
             halftime_frame=args.halftime_frame,
         )
-        ball_interpolator = BallInterpolator(fps=meta.get("fps", 25))
-        for record in frames_data:
+        from utils.detection_utils import normalize_ball
+
+        fps_meta = meta.get("fps", 25)
+        ball_interpolator = BallInterpolator(
+            fps=fps_meta, frame_width=w, frame_height=h
+        )
+        smoothed = ball_interpolator.smooth_frame_records(frames_data)
+        for record, ball_obs in zip(frames_data, smoothed):
             idx = record["frame_idx"]
-            ball_obs = ball_interpolator.update(
-                idx, tuple(record["ball"]) if record.get("ball") else None
-            )
             engine.update(idx, record["detections"], ball_obs.position, ball_observed=ball_obs.observed)
 
     if args.output:
