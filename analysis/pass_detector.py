@@ -8,10 +8,15 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from analysis.hybrid_event_classifier import HybridEventClassifier
+    from analysis.pitch_coordinates import PitchCoordinateMapper
 
 
 REF_WIDTH = 1280.0
 REF_FPS = 30.0
+
+# Soft caps for rejecting tracking teleports (FIFA ball ~ max ~40 m/s in play).
+MAX_BALL_SPEED_MPS = 42.0
+MAX_BALL_JUMP_M = 8.0  # per frame at typical fps — beyond this is a teleport
 
 
 def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -39,20 +44,27 @@ class PassDetector:
     fps: float = REF_FPS
     frame_width: float = REF_WIDTH
     possession_radius: float = 100.0
-    control_radius: float = 25.0
-    long_receive_radius: float = 72.0
-    nearby_radius: float = 120.0
-    high_speed: float = 12.0
-    release_dist: float = 40.0
-    long_pass_peak: float = 18.0
-    min_velocity_peak: float = 10.0
-    cooldown_frames: int = 12
-    min_receiver_dist: float = 25.0
-    min_ball_travel: float = 35.0
+    control_radius: float = 28.0
+    long_receive_radius: float = 80.0
+    nearby_radius: float = 130.0
+    high_speed: float = 10.0
+    release_dist: float = 32.0
+    long_pass_peak: float = 16.0
+    min_velocity_peak: float = 8.0
+    cooldown_frames: int = 10
+    min_receiver_dist: float = 22.0
+    min_ball_travel: float = 28.0
     control_stable_frames: int = 2
-    min_long_receive_frames: int = 25
+    min_long_receive_frames: int = 18
     # Only block near-instant bounce-backs (noise). Real give-and-gos are kept.
     return_window_frames: int = 22  # ~0.75s at 30fps ref
+    # Meter-space thresholds (used when pitch mapper is available).
+    min_ball_travel_m: float = 2.0
+    min_receiver_dist_m: float = 1.2
+    release_dist_m: float = 2.0
+    max_ball_speed_mps: float = MAX_BALL_SPEED_MPS
+    max_ball_jump_m: float = MAX_BALL_JUMP_M
+    pitch: PitchCoordinateMapper | None = None
     event_classifier: HybridEventClassifier | None = None
 
     events: list[PassEvent] = field(default_factory=list)
@@ -60,6 +72,7 @@ class PassDetector:
     _prev_ball: tuple[float, float] | None = None
     _prev_ball_frame: int = -1
     _peak_speed: float = 0.0
+    _peak_speed_mps: float = 0.0
     _in_flight: bool = False
     _release_frame: int = 0
     _ball_at_release: tuple[float, float] | None = None
@@ -86,6 +99,56 @@ class PassDetector:
 
     def _norm_speed(self, px_per_frame: float) -> float:
         return px_per_frame * self.fps / REF_FPS
+
+    def _meters(self, a: tuple[float, float], b: tuple[float, float]) -> float | None:
+        if self.pitch is None:
+            return None
+        return self.pitch.distance_m(a, b)
+
+    def _speed_mps(self, a: tuple[float, float], b: tuple[float, float], gap: int = 1) -> float | None:
+        if self.pitch is None:
+            return None
+        return self.pitch.speed_mps(a, b, frame_gap=gap)
+
+    def _on_pitch(self, ball: tuple[float, float]) -> bool:
+        if self.pitch is None:
+            return True
+        x_m, y_m = self.pitch.to_meters(ball)
+        return self.pitch.in_pitch(x_m, y_m)
+
+    def _implausible_segment(
+        self, prev: tuple[float, float], curr: tuple[float, float], gap: int
+    ) -> bool:
+        """Reject tracking teleports that would inflate pass counts / speeds."""
+        mps = self._speed_mps(prev, curr, gap)
+        if mps is not None and mps > self.max_ball_speed_mps:
+            return True
+        jump = self._meters(prev, curr)
+        if jump is not None and jump > self.max_ball_jump_m * max(1, gap):
+            return True
+        # Pixel fallback when uncalibrated: ~0.55 * frame_width per frame is absurd.
+        if mps is None and jump is None:
+            if _dist(prev, curr) / max(1, gap) > self.frame_width * 0.35:
+                return True
+        return False
+
+    def _travel_ok(self, release: tuple[float, float], receive: tuple[float, float]) -> bool:
+        travel_m = self._meters(release, receive)
+        if travel_m is not None:
+            return travel_m >= self.min_ball_travel_m
+        return _dist(release, receive) >= self._px(self.min_ball_travel)
+
+    def _receiver_sep_ok(self, passer_pos: tuple[float, float], recv_pos: tuple[float, float]) -> bool:
+        sep_m = self._meters(passer_pos, recv_pos)
+        if sep_m is not None:
+            return sep_m >= self.min_receiver_dist_m
+        return _dist(passer_pos, recv_pos) >= self._px(self.min_receiver_dist)
+
+    def _release_dist_ok(self, control_pos: tuple[float, float], ball: tuple[float, float]) -> bool:
+        d_m = self._meters(control_pos, ball)
+        if d_m is not None:
+            return d_m >= self.release_dist_m
+        return _dist(control_pos, ball) >= self._px(self.release_dist)
 
     def _closest_within(
         self, players: list[dict], ball: tuple[float, float], radius: float
@@ -194,8 +257,17 @@ class PassDetector:
             self._passer_at_release = self._nearby_tid
             self._passer_team = self._nearby_team
         self._peak_speed = 0.0
+        self._peak_speed_mps = 0.0
         self._long_receive_done = False
         self._flight_observations = 0
+
+    def _abort_flight(self) -> None:
+        self._in_flight = False
+        self._passer_at_release = None
+        self._long_receive_done = False
+        self._flight_observations = 0
+        self._peak_speed = 0.0
+        self._peak_speed_mps = 0.0
 
     def _record_pass(
         self,
@@ -227,6 +299,7 @@ class PassDetector:
         self._long_receive_done = False
         self._flight_observations = 0
         self._peak_speed = 0.0
+        self._peak_speed_mps = 0.0
         return event
 
     def _build_pass_features(
@@ -292,15 +365,23 @@ class PassDetector:
             return None
         if self._is_return_pass(from_tid, to_tid, frame_idx):
             return None
+        if not self._on_pitch(ball):
+            return None
+        if self._ball_at_release is not None and not self._on_pitch(self._ball_at_release):
+            return None
 
         recv_pos = _foot(receiver["bbox"])
-        if self._passer_pos is not None and _dist(self._passer_pos, recv_pos) < self._px(self.min_receiver_dist):
+        if self._passer_pos is not None and not self._receiver_sep_ok(self._passer_pos, recv_pos):
             return None
-        if (
-            self._ball_at_release is not None
-            and _dist(self._ball_at_release, ball) < self._px(self.min_ball_travel)
-        ):
+        if self._ball_at_release is not None and not self._travel_ok(self._ball_at_release, ball):
             return None
+
+        # Reject passes whose average flight speed is physically absurd.
+        if self._ball_at_release is not None and self.pitch is not None:
+            gap = max(1, frame_idx - self._release_frame)
+            avg_mps = self.pitch.speed_mps(self._ball_at_release, ball, frame_gap=gap)
+            if avg_mps > self.max_ball_speed_mps:
+                return None
 
         if mode == "control":
             if recv_dist > self._px(self.control_radius):
@@ -343,9 +424,31 @@ class PassDetector:
 
         self._current_players = players
 
+        # Drop / ignore teleport jumps so they never open a fake flight.
+        if (
+            self._prev_ball is not None
+            and frame_idx > self._prev_ball_frame
+            and self._implausible_segment(
+                self._prev_ball, ball, max(1, frame_idx - self._prev_ball_frame)
+            )
+        ):
+            if self._in_flight:
+                self._abort_flight()
+            self._prev_ball = ball if ball_observed else self._prev_ball
+            self._prev_ball_frame = frame_idx
+            return None
+
         speed = self._frame_speed(frame_idx, ball, ball_speed)
         if speed > 0:
             self._peak_speed = max(self._peak_speed, speed)
+        if (
+            self._prev_ball is not None
+            and frame_idx == self._prev_ball_frame + 1
+            and self.pitch is not None
+        ):
+            mps = self.pitch.speed_mps(self._prev_ball, ball, frame_gap=1)
+            self._peak_speed_mps = max(self._peak_speed_mps, mps)
+
         if ball_observed and self._in_flight:
             self._flight_observations += 1
 
@@ -373,12 +476,27 @@ class PassDetector:
         # leaving the last controller's feet. Avoids slow dribble "flights".
         dist_release = (
             self._last_control_pos is not None
-            and _dist(self._last_control_pos, ball) >= self._px(self.release_dist)
+            and self._release_dist_ok(self._last_control_pos, ball)
         )
         releasing = speed >= self.high_speed or (
-            dist_release and speed >= self.min_velocity_peak * 0.5
+            dist_release and speed >= self.min_velocity_peak * 0.45
         )
-        if releasing and (controller is None or self._control_streak < stable_control):
+        has_passer_context = (
+            self._last_control_tid is not None or self._nearby_tid is not None
+        )
+        # Allow release even while the ball is still inside the (generous) control
+        # radius of the same passer, once it has clearly left their feet at
+        # pass-like speed. Otherwise meter-space teleport caps prevent any
+        # single-frame exit from control_radius.
+        same_controller_leaving = (
+            controller is not None
+            and self._last_control_tid is not None
+            and controller["track_id"] == self._last_control_tid
+            and dist_release
+            and speed >= self.min_velocity_peak
+        )
+        open_release = controller is None or self._control_streak < stable_control
+        if releasing and has_passer_context and (open_release or same_controller_leaving):
             self._begin_flight(frame_idx, ball)
 
         if self._in_flight:

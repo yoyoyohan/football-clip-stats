@@ -147,11 +147,16 @@ class StatEngine:
         self._possessor_team: int | None = None
         self._possession_start_frame = 0
         self._last_touch_frame = 0
+        # Meaningful-play gate: idle / empty / no-ball sequences must not become 100%.
+        self._ball_present_frames = 0
+        self._controlled_possession_frames = 0
+        self._no_ball_streak = 0
 
         self.pass_detector = PassDetector(
             fps=fps,
             frame_width=frame_width,
             possession_radius=self.POSSESSION_RADIUS,
+            pitch=self.pitch,
         )
         self.goal_detector = GoalDetector(
             goal_boxes=goal_boxes,
@@ -251,22 +256,28 @@ class StatEngine:
         return float(np.linalg.norm(vel))
 
     def _update_possession(self, frame_idx: int, players: list[dict], ball: tuple[float, float] | None):
+        # Idle / empty / missing-ball frames stay "loose" (unknown). Do not keep
+        # crediting the last touch team forever — that produced 100% on pre-kickoff.
         if ball is None:
-            if self._last_touch_team is not None:
-                self._possession_frames[f"team{self._last_touch_team}"] += 1
-            else:
-                self._possession_frames["loose"] += 1
+            self._no_ball_streak += 1
+            self._possession_frames["loose"] += 1
+            # After a short occlusion grace (~0.4s), clear active possessor.
+            if self._no_ball_streak > max(3, int(self.fps * 0.4)):
+                self._check_dribble_end(frame_idx, False)
+                self._possessor_track_id = None
+                self._possessor_team = None
             return
+
+        self._no_ball_streak = 0
+        self._ball_present_frames += 1
 
         owner = self._closest_player_to_ball(players, ball)
         prev_track = self._possessor_track_id
         prev_team = self._possessor_team
 
         if owner is None:
-            if self._last_touch_team is not None:
-                self._possession_frames[f"team{self._last_touch_team}"] += 1
-            else:
-                self._possession_frames["loose"] += 1
+            # Ball visible but not controlled — count as loose, not last-team inherit.
+            self._possession_frames["loose"] += 1
             self._check_dribble_end(frame_idx, False)
             self._possessor_track_id = None
             self._possessor_team = None
@@ -276,6 +287,7 @@ class StatEngine:
         track_id = owner["track_id"]
         key = f"team{team}"
         self._possession_frames[key] += 1
+        self._controlled_possession_frames += 1
         self._last_touch_team = team
         self._last_touch_frame = frame_idx
 
@@ -633,17 +645,42 @@ class StatEngine:
         )
 
     def _possession_pct(self) -> dict:
-        total = sum(self._possession_frames.values()) or 1
+        team0 = self._possession_frames["team0"]
+        team1 = self._possession_frames["team1"]
+        loose = self._possession_frames["loose"]
+        controlled = team0 + team1
+        total = team0 + team1 + loose
+
+        # Empty / idle / pre-kickoff: no player ever controlled the ball → unknown
+        # (never invent 100% for one team from loose-only frames).
+        if controlled == 0:
+            if total == 0:
+                return {
+                    "team0_pct": 0.0,
+                    "team1_pct": 0.0,
+                    "loose_pct": 0.0,
+                    "unknown_pct": 100.0,
+                }
+            return {
+                "team0_pct": 0.0,
+                "team1_pct": 0.0,
+                "loose_pct": loose / total * 100.0,
+                "unknown_pct": 100.0,
+            }
+
         result = {
-            "team0_pct": self._possession_frames["team0"] / total * 100,
-            "team1_pct": self._possession_frames["team1"] / total * 100,
-            "loose_pct": self._possession_frames["loose"] / total * 100,
+            "team0_pct": team0 / total * 100.0,
+            "team1_pct": team1 / total * 100.0,
+            "loose_pct": loose / total * 100.0,
+            "unknown_pct": 0.0,
         }
-        # Single-team clips: unattributed loose ball -> sole possessing team
-        if result["team1_pct"] == 0.0 and result["loose_pct"] > 0.0:
+        # Single-team clips only: fold loose into the sole team that actually
+        # controlled the ball for a meaningful stretch (not idle inheritance).
+        min_play = max(5, int(self.fps * 0.4))
+        if team1 == 0 and team0 >= min_play and loose > 0:
             result["team0_pct"] += result["loose_pct"]
             result["loose_pct"] = 0.0
-        elif result["team0_pct"] == 0.0 and result["loose_pct"] > 0.0:
+        elif team0 == 0 and team1 >= min_play and loose > 0:
             result["team1_pct"] += result["loose_pct"]
             result["loose_pct"] = 0.0
         return result

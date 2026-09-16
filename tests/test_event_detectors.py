@@ -204,3 +204,126 @@ def test_shot_not_confirmed_on_interpolated_frames():
 
     assert event is None
     assert det.counts()["team0_shots"] == 0
+
+
+def test_undercounted_style_pass_sequence():
+    """Short clip with two clear teammate transfers should not undercount.
+
+    Steps stay under ~40 m/s so meter-space teleport rejection does not fire.
+    """
+    pitch = _pitch()
+    det = PassDetector(
+        fps=25.0,
+        frame_width=1920,
+        high_speed=10.0,
+        min_velocity_peak=8.0,
+        cooldown_frames=6,
+        pitch=pitch,
+    )
+
+    p1 = _player(1, 0, 400, 500)
+    p2 = _player(2, 0, 700, 500)
+    p3 = _player(3, 0, 1000, 500)
+
+    # Establish control with passer 1.
+    for i in range(5):
+        det.update(i, (400, 510), 3.0, [p1, p2, p3])
+
+    # Pass 1 flight: ~25 px/frame (~36 m/s) toward player 2.
+    event = None
+    x = 400.0
+    frame = 5
+    while x < 700:
+        x += 25.0
+        frame += 1
+        players = [p1, p2, p3] if x >= 680 else [p1, p2, p3]
+        # Leave passer feet early so release triggers.
+        near = [] if 430 < x < 680 else [p1, p2, p3]
+        if x >= 680:
+            near = [p1, p2, p3]
+        event = det.update(frame, (x, 510), 20.0, near, ball_observed=True)
+    if event is None:
+        event = det.update(frame + 1, (700, 510), 3.0, [p1, p2, p3], ball_observed=True)
+        frame += 1
+    assert event is not None
+    assert event.from_track_id == 1
+    assert event.to_track_id == 2
+
+    # Re-establish control with receiver 2, then pass to 3.
+    for j in range(5):
+        frame += 1
+        det.update(frame, (700, 510), 3.0, [p1, p2, p3])
+
+    event2 = None
+    x = 700.0
+    while x < 1000:
+        x += 25.0
+        frame += 1
+        near = [p1, p2, p3] if x >= 980 else ([p2, p3] if x > 730 else [p1, p2, p3])
+        if 730 < x < 980:
+            near = [p1, p3]  # ball in flight away from feet
+        event2 = det.update(frame, (x, 510), 20.0, near, ball_observed=True)
+    if event2 is None:
+        event2 = det.update(frame + 1, (1000, 510), 3.0, [p1, p2, p3], ball_observed=True)
+    assert event2 is not None
+    assert event2.from_track_id == 2
+    assert event2.to_track_id == 3
+    assert det.counts()["team0_passes"] == 2
+
+
+def test_pass_rejects_teleport_jump():
+    """Implausible ball teleports must not become passes."""
+    pitch = _pitch()
+    det = PassDetector(fps=25.0, frame_width=1920, pitch=pitch, cooldown_frames=2)
+    passer = [_player(1, 0, 200, 500)]
+    receiver = [_player(2, 0, 1700, 500)]
+
+    for i in range(4):
+        det.update(i, (200, 500), 2.0, passer)
+    # Teleport across the frame in one tick.
+    det.update(4, (1700, 500), 200.0, [], ball_observed=True)
+    event = det.update(5, (1700, 500), 2.0, receiver, ball_observed=True)
+
+    assert event is None
+    assert det.counts()["team0_passes"] == 0
+
+
+def test_shot_toward_goal_without_possessor_team():
+    """Clear goal-bound trajectory with player context but no possession team."""
+    pitch = _pitch()
+    det = ShotDetector(
+        pitch=pitch,
+        min_shot_speed_mps=10.0,
+        confirm_frames=2,
+        cooldown_frames=1,
+        fast_shot_speed_mps=18.0,
+        fast_confirm_frames=1,
+    )
+
+    path = [
+        _m_to_px(72.0, 34.0),
+        _m_to_px(78.0, 34.0),
+        _m_to_px(84.0, 34.0),
+        _m_to_px(90.0, 34.0),
+    ]
+    players = [_player(7, 0, _m_to_px(70.0, 34.0)[0], _m_to_px(70.0, 34.0)[1])]
+
+    event = None
+    for i, pt in enumerate(path):
+        vx = 0.0 if i == 0 else pt[0] - path[i - 1][0]
+        event = det.update(
+            i,
+            pt,
+            speed_mps=25.0,
+            vx_sign=vx,
+            possessor_track_id=None,
+            possessor_team=None,
+            ball_observed=True,
+            players=players,
+        )
+        if event is not None:
+            break
+
+    assert event is not None
+    assert event.team_id == 0
+    assert det.counts()["team0_shots"] == 1

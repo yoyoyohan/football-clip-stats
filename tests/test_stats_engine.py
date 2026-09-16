@@ -108,3 +108,41 @@ def test_export_json(tmp_path, engine):
     out = tmp_path / "stats.json"
     engine.export_json(str(out))
     assert out.exists()
+
+
+def test_empty_idle_possession_not_100(engine):
+    """Idle / empty / no-ball sequences must not report 100% for a team."""
+    # No detections, no ball — pure idle.
+    for i in range(20):
+        engine.update(i, [], None)
+    stats = engine.get_stats()
+    poss = stats["possession"]
+    assert poss["team0_pct"] == 0.0
+    assert poss["team1_pct"] == 0.0
+    assert poss.get("unknown_pct", 0.0) >= 99.0 or poss["loose_pct"] >= 99.0
+    assert poss["team0_pct"] + poss["team1_pct"] < 1.0
+
+
+def test_pre_kickoff_players_no_ball_not_100(engine):
+    """Players standing around with no ball should stay unknown / loose."""
+    dets = [_player(1, 0, 400, 500), _player(2, 1, 900, 500)]
+    for i in range(25):
+        engine.update(i, dets, None)
+    stats = engine.get_stats()
+    poss = stats["possession"]
+    assert poss["team0_pct"] == 0.0
+    assert poss["team1_pct"] == 0.0
+    assert poss.get("unknown_pct", 0.0) >= 99.0 or poss["loose_pct"] >= 99.0
+
+
+def test_loose_ball_visible_not_forced_to_team(engine):
+    """Visible ball far from all players stays loose, not assigned 100%."""
+    dets = [_player(1, 0, 200, 200), _player(2, 1, 1700, 900)]
+    ball = (960.0, 540.0)
+    for i in range(20):
+        engine.update(i, dets, ball)
+    stats = engine.get_stats()
+    poss = stats["possession"]
+    assert poss["team0_pct"] == 0.0
+    assert poss["team1_pct"] == 0.0
+    assert poss["loose_pct"] > 50.0 or poss.get("unknown_pct", 0.0) > 50.0

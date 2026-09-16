@@ -26,13 +26,16 @@ class ShotEvent:
 class ShotDetector:
     pitch: PitchCoordinateMapper
     attacking_direction: str = "left_to_right"
-    min_shot_speed_mps: float = 12.0
+    min_shot_speed_mps: float = 10.0
+    # High-speed shots may use a slightly shorter confirm window (still >=1 prior frame).
+    fast_shot_speed_mps: float = 18.0
+    fast_confirm_frames: int = 2
     min_attack_x_team0: float = 55.0
     max_attack_x_team1: float = 50.0
     cooldown_frames: int = 45
     confirm_frames: int = 2
     # Goal-mouth projection tolerance beyond posts (meters).
-    goal_mouth_y_margin_m: float = 5.0
+    goal_mouth_y_margin_m: float = 6.5
     # Reject shot if a teammate sits on the ball path within this corridor.
     teammate_path_lateral_m: float = 3.5
     teammate_path_min_ahead_m: float = 3.0
@@ -154,6 +157,33 @@ class ShotDetector:
                 return True
         return False
 
+
+    def _nearest_player_team(
+        self,
+        ball_px: tuple[float, float],
+        players: list[dict] | None,
+        max_dist_m: float = 6.0,
+    ) -> tuple[int | None, int | None]:
+        """Infer (track_id, team_id) from nearest on-pitch player when possession is flaky."""
+        if not players:
+            return None, None
+        best_tid, best_team, best_d = None, None, float("inf")
+        for p in players:
+            team = p.get("team_id")
+            tid = p.get("track_id")
+            bbox = p.get("bbox")
+            if team is None or tid is None or bbox is None:
+                continue
+            foot_px = self.pitch.foot_px(bbox)
+            d = self.pitch.distance_m(foot_px, ball_px)
+            if d < best_d:
+                best_d = d
+                best_tid = tid
+                best_team = team
+        if best_d <= max_dist_m:
+            return best_tid, best_team
+        return None, None
+
     def _toward_goal(
         self,
         x_m: float,
@@ -208,7 +238,24 @@ class ShotDetector:
         prev_xy = self._prev_xy
         self._prev_xy = (x_m, y_m)
 
-        team = self._attacking_team(x_m, speed_mps, vx_sign, possessor_team)
+        # When jersey/possession IDs are flaky (e.g. all-black kits), fall back to
+        # nearest player context so clear goal-bound trajectories still register.
+        shooter_tid = possessor_track_id
+        team_hint = possessor_team
+        if team_hint is None:
+            near_tid, near_team = self._nearest_player_team(ball_px, players)
+            if near_team is not None:
+                team_hint = near_team
+                if shooter_tid is None:
+                    shooter_tid = near_tid
+
+        team = self._attacking_team(x_m, speed_mps, vx_sign, team_hint)
+        if team is None and team_hint is not None and speed_mps >= self.min_shot_speed_mps:
+            # Trust player context in the final third even if vx_sign is noisy.
+            if team_hint == 0 and x_m >= self.min_attack_x_team0 * 0.9:
+                team = 0
+            elif team_hint == 1 and x_m <= self.max_attack_x_team1 * 1.1:
+                team = 1
         if team is None or speed_mps < self.min_shot_speed_mps:
             self._clear_pending()
             return None
@@ -218,7 +265,7 @@ class ShotDetector:
             return None
 
         if not self._toward_goal(
-            x_m, y_m, prev_xy, team, vx_sign, players, possessor_track_id
+            x_m, y_m, prev_xy, team, vx_sign, players, shooter_tid
         ):
             self._clear_pending()
             return None
@@ -261,7 +308,12 @@ class ShotDetector:
             }
             self._confirm_streak = 1
 
-        if self._confirm_streak < self.confirm_frames:
+        needed = self.confirm_frames
+        if float(self._pending["speed"]) >= self.fast_shot_speed_mps:
+            # Still require at least 2 toward-goal frames so interpolated gaps cannot
+            # single-frame a shot after pending was cleared.
+            needed = max(2, min(needed, self.fast_confirm_frames))
+        if self._confirm_streak < needed:
             return None
         if frame_idx - self._last_shot_frame < self.cooldown_frames:
             return None
@@ -269,7 +321,7 @@ class ShotDetector:
         event = ShotEvent(
             frame=frame_idx,
             team_id=team,
-            shooter_track_id=possessor_track_id,
+            shooter_track_id=shooter_tid if shooter_tid is not None else possessor_track_id,
             ball_speed_mps=float(self._pending["speed"]),
             distance_to_goal_m=float(self._pending["dist"]),
             on_target=bool(self._pending["on_target"]),
