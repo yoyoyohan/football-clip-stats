@@ -187,30 +187,28 @@ def test_real_shot_still_counted():
     assert det.counts()["team0_shots"] == 1
 
 
-def test_shot_not_confirmed_on_interpolated_frames():
-    """Interpolated / unobserved ball frames must clear pending shot confirmation."""
+def test_shot_keeps_pending_across_interpolated_frames():
+    """Interpolated frames must not wipe a toward-goal confirmation streak."""
     pitch = _pitch()
     det = ShotDetector(pitch=pitch, min_shot_speed_mps=12.0, confirm_frames=2, cooldown_frames=1)
 
     p0 = _m_to_px(70.0, 34.0)
     p1 = _m_to_px(74.0, 34.0)
     p2 = _m_to_px(78.0, 34.0)
+    p3 = _m_to_px(82.0, 34.0)
 
     det.update(0, p0, 100.0, 0.0, 1, 0, ball_observed=True)
     det.update(1, p1, 100.0, p1[0] - p0[0], 1, 0, ball_observed=True)
-    # Interpolated frame mid-confirmation should reset streak.
+    # Gap fill mid-flight — pending should survive.
     det.update(2, p2, 100.0, p2[0] - p1[0], 1, 0, ball_observed=False)
-    event = det.update(3, p2, 100.0, 1.0, 1, 0, ball_observed=True)
+    event = det.update(3, p3, 100.0, p3[0] - p2[0], 1, 0, ball_observed=True)
 
-    assert event is None
-    assert det.counts()["team0_shots"] == 0
+    assert event is not None
+    assert det.counts()["team0_shots"] == 1
 
 
 def test_undercounted_style_pass_sequence():
-    """Short clip with two clear teammate transfers should not undercount.
-
-    Steps stay under ~40 m/s so meter-space teleport rejection does not fire.
-    """
+    """Short clip with two clear teammate transfers should not undercount."""
     pitch = _pitch()
     det = PassDetector(
         fps=25.0,
@@ -327,3 +325,39 @@ def test_shot_toward_goal_without_possessor_team():
     assert event is not None
     assert event.team_id == 0
     assert det.counts()["team0_shots"] == 1
+
+
+def test_pass_survives_wide_fov_meter_speed():
+    """Ordinary ~30 px/frame flight must count even when default H maps it >42 m/s."""
+    pitch = _pitch(fps=30.0)
+    det = PassDetector(
+        fps=30.0,
+        frame_width=1920,
+        high_speed=10.0,
+        min_velocity_peak=8.0,
+        cooldown_frames=6,
+        pitch=pitch,
+    )
+    p1 = _player(1, 0, 400, 500)
+    p2 = _player(2, 0, 700, 500)
+
+    for i in range(5):
+        det.update(i, (400, 510), 3.0, [p1, p2])
+
+    event = None
+    x = 400.0
+    frame = 5
+    while x < 700:
+        x += 30.0
+        frame += 1
+        near = [p1, p2] if x >= 680 else []
+        event = det.update(frame, (x, 510), 20.0, near, ball_observed=True)
+    if event is None:
+        event = det.update(frame + 1, (700, 510), 3.0, [p1, p2], ball_observed=True)
+
+    assert event is not None
+    assert event.from_track_id == 1
+    assert event.to_track_id == 2
+    # Sanity: this step rate is >42 m/s under default-style H @ 30fps.
+    assert pitch.speed_mps((0.0, 0.0), (30.0, 0.0), frame_gap=1) > 42.0
+

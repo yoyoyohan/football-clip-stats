@@ -222,12 +222,18 @@ class ShotDetector:
         ball_observed: bool = True,
         players: list[dict] | None = None,
     ) -> ShotEvent | None:
-        if ball_px is None or not ball_observed:
+        if ball_px is None:
             self._clear_pending()
-            # Keep last observed pitch position so the next observed segment can
-            # form a trajectory; drop it only when the ball is fully missing.
-            if ball_px is None:
-                self._prev_xy = None
+            self._prev_xy = None
+            return None
+
+        # Interpolated / held frames: keep pending confirmation alive. Sparse
+        # ball detectors (common after finetunes) otherwise never get two
+        # consecutive observed toward-goal frames and report 0 shots.
+        if not ball_observed:
+            x_m, y_m = self.pitch.to_meters(ball_px)
+            if self.pitch.in_pitch(x_m, y_m):
+                self._prev_xy = (x_m, y_m)
             return None
 
         x_m, y_m = self.pitch.to_meters(ball_px)

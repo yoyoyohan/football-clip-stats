@@ -14,7 +14,10 @@ if TYPE_CHECKING:
 REF_WIDTH = 1280.0
 REF_FPS = 30.0
 
-# Soft caps for rejecting tracking teleports (FIFA ball ~ max ~40 m/s in play).
+# Soft caps for rejecting tracking teleports.
+# Instantaneous FIFA max (~40 m/s) is NOT used as a per-frame gate: wide-FOV
+# / default homographies map ordinary on-screen motion above that. Jump
+# distance is the reliable teleport signal; avg flight m/s uses a looser cap.
 MAX_BALL_SPEED_MPS = 42.0
 MAX_BALL_JUMP_M = 8.0  # per frame at typical fps — beyond this is a teleport
 
@@ -119,17 +122,22 @@ class PassDetector:
     def _implausible_segment(
         self, prev: tuple[float, float], curr: tuple[float, float], gap: int
     ) -> bool:
-        """Reject tracking teleports that would inflate pass counts / speeds."""
-        mps = self._speed_mps(prev, curr, gap)
-        if mps is not None and mps > self.max_ball_speed_mps:
+        """Reject tracking teleports that would inflate pass counts / speeds.
+
+        Use spatial jump (meters or pixels), not instantaneous m/s.
+
+        Wide-FOV / default homographies map ~30 px/frame to >42 m/s even for
+        ordinary kicks, so a FIFA max-speed gate falsely aborts every real
+        flight and yields 0 passes. True teleports are huge jumps (many meters
+        or a large fraction of the frame) — those still get rejected here.
+        """
+        gap = max(1, gap)
+        px_per_frame = _dist(prev, curr) / gap
+        if px_per_frame > self.frame_width * 0.35:
             return True
         jump = self._meters(prev, curr)
-        if jump is not None and jump > self.max_ball_jump_m * max(1, gap):
+        if jump is not None and jump > self.max_ball_jump_m * gap:
             return True
-        # Pixel fallback when uncalibrated: ~0.55 * frame_width per frame is absurd.
-        if mps is None and jump is None:
-            if _dist(prev, curr) / max(1, gap) > self.frame_width * 0.35:
-                return True
         return False
 
     def _travel_ok(self, release: tuple[float, float], receive: tuple[float, float]) -> bool:
@@ -376,11 +384,13 @@ class PassDetector:
         if self._ball_at_release is not None and not self._travel_ok(self._ball_at_release, ball):
             return None
 
-        # Reject passes whose average flight speed is physically absurd.
+        # Reject only absurd average flight speeds. Keep this loose: default /
+        # wide-FOV homographies inflate m/s, and short hard passes are often
+        # >42 m/s even with good calibration.
         if self._ball_at_release is not None and self.pitch is not None:
             gap = max(1, frame_idx - self._release_frame)
             avg_mps = self.pitch.speed_mps(self._ball_at_release, ball, frame_gap=gap)
-            if avg_mps > self.max_ball_speed_mps:
+            if avg_mps > self.max_ball_speed_mps * 2.0:
                 return None
 
         if mode == "control":

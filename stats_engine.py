@@ -597,9 +597,10 @@ class StatEngine:
         speed_mps = 0.0
         vx_sign = 0.0
         if ball is not None and len(self._ball_history) >= 2:
-            _, p0 = self._ball_history[-2]
-            _, p1 = self._ball_history[-1]
-            speed_mps = self.pitch.speed_mps(p0, p1, frame_gap=1)
+            f0, p0 = self._ball_history[-2]
+            f1, p1 = self._ball_history[-1]
+            gap = max(1, int(f1) - int(f0))
+            speed_mps = self.pitch.speed_mps(p0, p1, frame_gap=gap)
             vx_sign = p1[0] - p0[0]
 
         self.pass_detector.update(frame_idx, ball, speed, players, ball_observed=ball_observed)
