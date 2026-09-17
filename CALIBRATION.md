@@ -1,7 +1,8 @@
 # Calibration Guide — Follow This Pipeline
 
-Do this **once per video** (or once per camera angle).  
 Calibration maps the TV image → a real pitch (105×68 meters) so passes, shots, and goals use real distances.
+
+**Automatic calibration is the default.** Interactive clicking is the fallback when auto-cal cannot find stable goalposts.
 
 ---
 
@@ -11,18 +12,57 @@ Calibration maps the TV image → a real pitch (105×68 meters) so passes, shots
 # 1. Put your clip here
 #    input_videos/myclip.mp4
 
-# 2. Calibrate (opens video — scrub, then click)
-python calibrate_pitch.py --source input_videos/myclip.mp4
-
-# 3. Run stats
+# 2. Run stats — pitch auto-calibrates from YOLO goalpost detections
 python run_clip.py --source input_videos/myclip.mp4 --no-cache
 ```
 
-Done. Calibration is saved as `calibration/myclip.json`.
+Done. If goalposts were visible often enough, calibration is saved as `calibration/myclip.json` with `"method": "goalpost_auto_multiframe"`.
+
+Optional: force a fresh auto-cal even if a manual JSON already exists:
+
+```bash
+python run_clip.py --source input_videos/myclip.mp4 --force-auto-cal
+```
 
 ---
 
-## Step-by-step
+## How automatic calibration works
+
+`run_clip.py` calls `robust_auto_calibration_from_frames` when:
+
+| Situation | Behavior |
+|-----------|----------|
+| No `calibration/<clip>.json` | Auto-calibrate (default) |
+| Existing JSON method is `goalpost_auto*` **and** `--no-cache` | Refresh auto-cal |
+| Existing JSON method is manual / landmarks / corners / single_goal | **Keep** it (unless `--force-auto-cal`) |
+| `--force-auto-cal` | Always recompute auto-cal |
+
+The auto-calibrator:
+
+1. Collects goalpost detections across frames (`overlay.goalposts` or `detections`)
+2. Aggregates stable left/right post **feet** (bbox bottom-center) via median / clustering
+3. Infers goal side (left / right / both)
+4. Builds a homography (`build_calibration_from_one_goal` or dual-goal landmarks)
+5. Quality-gates: enough posts, plausible separation, pitch sanity — returns `None` if bad
+
+If auto-cal fails, `run_clip` falls back to the interactive tools below (or a default homography).
+
+---
+
+## Interactive fallback
+
+Use this when auto-cal fails, or when you want higher accuracy on a tricky camera angle.
+
+```bash
+# Opens video — scrub, then click
+python calibrate_pitch.py --source input_videos/myclip.mp4
+```
+
+Calibration is saved as `calibration/myclip.json` (manual methods are preserved by `run_clip` unless you pass `--force-auto-cal`).
+
+---
+
+## Step-by-step (interactive)
 
 ### Step 1 — Open the calibrator
 
@@ -153,21 +193,21 @@ python run_clip.py --source input_videos/moroccomatch.mp4 --no-cache --team0-nam
 |------|------------|
 | `output_videos/YOURCLIP_stats.json` | Passes, shots, SOT, goals, possession |
 | `output_videos/YOURCLIP_stats_per_frame.csv` | Possession + ball position per frame |
-| `calibration/YOURCLIP.json` | Your pitch calibration (reuse next run) |
+| `calibration/YOURCLIP.json` | Pitch calibration (auto or manual; reuse next run) |
 
 ---
 
 ## Decision cheat sheet
 
 ```
-Open calibrator
+run_clip (default)
       │
       ▼
-Scrub video ──► see a GOAL? ──yes──► default mode (2 posts) ──► save ──► run_clip
+goalposts across frames? ──yes──► auto multi-frame cal ──► save JSON ──► stats
       │
-      no
+      no / failed
       ▼
-See pitch LINES / center / box? ──yes──► --mode landmarks (4+ clicks) ──► save ──► run_clip
+Interactive calibrate_pitch? ──yes──► click posts/landmarks ──► save ──► run_clip
       │
       no
       ▼
@@ -180,8 +220,10 @@ Skip calibration ──► run_clip anyway (passes/possession still work)
 
 | Problem | Fix |
 |---------|-----|
-| Keys do nothing | Click the **terminal**, type `l` / `r` / `c` there (Mac OpenCV quirk) |
-| Only 2 marks visible | One-goal mode is fine — press `c` after 2 posts |
+| Auto-cal failed / quality low | Run interactive `calibrate_pitch.py`, or ensure goalposts are detected (`--no-cache`) |
+| Want to redo auto-cal | `python run_clip.py --source ... --force-auto-cal` (or `--no-cache` if prior method was auto) |
+| Keys do nothing (interactive) | Click the **terminal**, type `l` / `r` / `c` there (Mac OpenCV quirk) |
+| Only 2 marks visible | One-goal interactive mode is fine — press `c` after 2 posts |
 | No goal in whole clip | Use `--mode landmarks`, or skip calibration |
 | Stats look wrong after new calibration | Add `--no-cache` when running `run_clip.py` |
-| Want to redo calibration | Run `calibrate_pitch.py` again (overwrites `calibration/YOURCLIP.json`) |
+| Want to keep manual cal | Don’t pass `--force-auto-cal` — manual JSON is preserved |

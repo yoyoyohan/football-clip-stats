@@ -52,6 +52,10 @@ class Tracker:
                     tracker_id=trackable.tracker_id,
                     data=trackable.data,
                 )
+            # Ball from pre-track detections: ByteTrack often drops intermittent
+            # small-object hits, which zeroed ball recall with newer weights.
+            ball = extract_ball(trackable, cls_names_inv)
+
             detection_with_tracks = self.tracker.update_with_detections(trackable)
 
             frame_detections = []
@@ -63,8 +67,6 @@ class Tracker:
                 det_dict = detection_from_raw(overlay, i, cls_names, require_track_id=False)
                 if det_dict is not None:
                     frame_detections.append(det_dict)
-
-            ball = extract_ball(detection_with_tracks, cls_names_inv)
             frame_records.append(
                 {
                     "frame_idx": frame_num,
