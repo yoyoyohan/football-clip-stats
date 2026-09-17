@@ -67,12 +67,12 @@ class PassDetector:
     min_receiver_dist: float = 22.0
     min_ball_travel: float = 28.0
     control_stable_frames: int = 2
-    min_long_receive_frames: int = 18
+    min_long_receive_frames: int = 12
     # Only block near-instant bounce-backs (noise). Real give-and-gos are kept.
     return_window_frames: int = 22  # ~0.75s at 30fps ref
     # Meter-space thresholds (used when pitch mapper is available).
-    min_ball_travel_m: float = 2.0
-    min_receiver_dist_m: float = 1.2
+    min_ball_travel_m: float = 1.0  # short passes under wide/default H
+    min_receiver_dist_m: float = 0.8
     release_dist_m: float = 2.0
     max_ball_speed_mps: float = MAX_BALL_SPEED_MPS
     max_ball_jump_m: float = MAX_BALL_JUMP_M
@@ -425,7 +425,8 @@ class PassDetector:
                 return None
             if self._control_streak < self._frames(self.control_stable_frames):
                 return None
-            if not ball_observed:
+            # Sparse ball tracks: allow interpolated receive once flight was observed.
+            if not ball_observed and self._flight_observations < 1:
                 return None
         else:
             if self._long_receive_done:
@@ -438,7 +439,7 @@ class PassDetector:
                 return None
             if recv_dist > self._px(self.long_receive_radius):
                 return None
-            if not ball_observed:
+            if not ball_observed and self._flight_observations < 1:
                 return None
             self._long_receive_done = True
 
