@@ -54,6 +54,15 @@ class PassDetector:
     release_dist: float = 32.0
     long_pass_peak: float = 16.0
     min_velocity_peak: float = 8.0
+    # Meter-space velocity gates (used when pitch is available). Wide-FOV /
+    # distant cameras yield low px/frame even for real passes; meters stay
+    # pass-like (~5–10 m/s). Either pixel OR meter peak may clear the gate.
+    min_velocity_peak_mps: float = 5.5
+    high_speed_mps: float = 6.5
+    long_pass_peak_mps: float = 10.0
+    # Abort in-flight state after this many ref frames without a receive so a
+    # weak/orphan release cannot lock the detector for the rest of the clip.
+    max_flight_frames: int = 60
     cooldown_frames: int = 10
     min_receiver_dist: float = 22.0
     min_ball_travel: float = 28.0
@@ -200,6 +209,24 @@ class PassDetector:
             return self._norm_speed(min(ball_speed, 60.0))
         return 0.0
 
+
+    def _peak_velocity_ok(
+        self,
+        min_px: float | None = None,
+        min_mps: float | None = None,
+    ) -> bool:
+        """True if pixel-normalized peak OR meter peak clears the threshold.
+
+        Pixel-only when pitch is None (unit tests / uncalibrated runs).
+        """
+        min_px = self.min_velocity_peak if min_px is None else min_px
+        min_mps = self.min_velocity_peak_mps if min_mps is None else min_mps
+        if self._peak_speed >= min_px:
+            return True
+        if self.pitch is not None and self._peak_speed_mps >= min_mps:
+            return True
+        return False
+
     def _cooldown_ok(self, frame_idx: int, from_tid: int, to_tid: int) -> bool:
         gap = frame_idx - self._last_pass_frame
         needed = self._frames(self.cooldown_frames)
@@ -236,7 +263,7 @@ class PassDetector:
 
         # Confirmed ball flight with meaningful travel → real give-and-go.
         if self._in_flight and (
-            self._peak_speed >= self.min_velocity_peak or self._flight_observations >= 1
+            self._peak_velocity_ok() or self._flight_observations >= 1
         ):
             if travel >= self._px(self.min_ball_travel * 0.5):
                 return False
@@ -364,7 +391,7 @@ class PassDetector:
             return None
         if not self._in_flight:
             return None
-        if self._peak_speed < self.min_velocity_peak:
+        if not self._peak_velocity_ok():
             return None
         # Require at least one observed in-flight frame (blocks interpolated FPs).
         if self._flight_observations < 1:
@@ -403,7 +430,9 @@ class PassDetector:
         else:
             if self._long_receive_done:
                 return None
-            if self._peak_speed < self.long_pass_peak:
+            if not self._peak_velocity_ok(
+                min_px=self.long_pass_peak, min_mps=self.long_pass_peak_mps
+            ):
                 return None
             if frame_idx - self._release_frame < self._frames(self.min_long_receive_frames):
                 return None
@@ -484,12 +513,28 @@ class PassDetector:
         stable_control = self._frames(self.control_stable_frames)
         # Require a clearer release: high speed alone, or moderate speed plus
         # leaving the last controller's feet. Avoids slow dribble "flights".
+        # When pitch is available, meter speed can also open a release even if
+        # pixel speed is low (wide-FOV / distant cameras).
         dist_release = (
             self._last_control_pos is not None
             and self._release_dist_ok(self._last_control_pos, ball)
         )
-        releasing = speed >= self.high_speed or (
-            dist_release and speed >= self.min_velocity_peak * 0.45
+        mps_now = 0.0
+        if (
+            self.pitch is not None
+            and self._prev_ball is not None
+            and frame_idx == self._prev_ball_frame + 1
+        ):
+            mps_now = self.pitch.speed_mps(self._prev_ball, ball, frame_gap=1)
+        releasing = (
+            speed >= self.high_speed
+            or (dist_release and speed >= self.min_velocity_peak * 0.45)
+            or (self.pitch is not None and mps_now >= self.high_speed_mps)
+            or (
+                self.pitch is not None
+                and dist_release
+                and mps_now >= self.min_velocity_peak_mps * 0.7
+            )
         )
         has_passer_context = (
             self._last_control_tid is not None or self._nearby_tid is not None
@@ -503,14 +548,25 @@ class PassDetector:
             and self._last_control_tid is not None
             and controller["track_id"] == self._last_control_tid
             and dist_release
-            and speed >= self.min_velocity_peak
+            and (
+                speed >= self.min_velocity_peak
+                or (self.pitch is not None and mps_now >= self.min_velocity_peak_mps)
+            )
         )
         open_release = controller is None or self._control_streak < stable_control
         if releasing and has_passer_context and (open_release or same_controller_leaving):
+            # begin_flight zeroes peaks; keep the release-frame speed so a
+            # sparse-observation flight can still clear velocity gates.
             self._begin_flight(frame_idx, ball)
+            self._peak_speed = max(self._peak_speed, speed)
+            if self.pitch is not None:
+                self._peak_speed_mps = max(self._peak_speed_mps, mps_now)
 
         if self._in_flight:
-            if controller is not None:
+            # Stale flight: one weak release must not lock the detector forever.
+            if frame_idx - self._release_frame >= self._frames(self.max_flight_frames):
+                self._abort_flight()
+            elif controller is not None:
                 event = self._try_pass_to(
                     frame_idx, ball, controller, control_dist, "control", ball_observed
                 )
@@ -519,17 +575,21 @@ class PassDetector:
                     self._prev_ball_frame = frame_idx
                     return event
 
-            long_recv, long_dist = self._receiver_candidate(
-                players, ball, self._px(self.long_receive_radius)
-            )
-            if long_recv is not None and self._peak_speed >= self.long_pass_peak:
-                event = self._try_pass_to(
-                    frame_idx, ball, long_recv, long_dist, "long", ball_observed
+            if self._in_flight:
+                long_recv, long_dist = self._receiver_candidate(
+                    players, ball, self._px(self.long_receive_radius)
                 )
-                if event is not None:
-                    self._prev_ball = ball
-                    self._prev_ball_frame = frame_idx
-                    return event
+                long_peak_ok = self._peak_velocity_ok(
+                    min_px=self.long_pass_peak, min_mps=self.long_pass_peak_mps
+                )
+                if long_recv is not None and long_peak_ok:
+                    event = self._try_pass_to(
+                        frame_idx, ball, long_recv, long_dist, "long", ball_observed
+                    )
+                    if event is not None:
+                        self._prev_ball = ball
+                        self._prev_ball_frame = frame_idx
+                        return event
 
         if not self._in_flight and controller is not None and self._control_streak >= stable_control:
             tid = controller["track_id"]

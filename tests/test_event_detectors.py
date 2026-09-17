@@ -361,3 +361,121 @@ def test_pass_survives_wide_fov_meter_speed():
     # Sanity: this step rate is >42 m/s under default-style H @ 30fps.
     assert pitch.speed_mps((0.0, 0.0), (30.0, 0.0), frame_gap=1) > 42.0
 
+def test_low_px_speed_pass_via_meter_peak():
+    """Wide-FOV style: low px/frame but pass-like m/s still counts as a pass.
+
+    Default identity-scale pitch maps ~3 px/frame to only ~4.9 m/s @ 30fps.
+    Use a coarser meters-per-pixel scale so 3 px/frame ≈ 9 m/s while remaining
+    well below the pixel min_velocity_peak (8).
+    """
+    import math
+
+    class _FakePitch:
+        def __init__(self, m_per_px: float, fps: float = 30.0):
+            self.m_per_px = m_per_px
+            self.fps = fps
+
+        def to_meters(self, point_px):
+            return (point_px[0] * self.m_per_px, point_px[1] * self.m_per_px)
+
+        def distance_m(self, a_px, b_px):
+            return math.hypot(a_px[0] - b_px[0], a_px[1] - b_px[1]) * self.m_per_px
+
+        def speed_mps(self, a_px, b_px, frame_gap: int = 1):
+            return self.distance_m(a_px, b_px) / (max(1, frame_gap) / self.fps)
+
+        def in_pitch(self, x_m, y_m, margin: float = 2.0):
+            return True
+
+    # 3 px/frame * 0.1 m/px * 30 fps = 9 m/s (>= 5.5); norm px speed = 3 (< 8).
+    pitch = _FakePitch(m_per_px=0.1, fps=30.0)
+    det = PassDetector(
+        fps=30.0,
+        frame_width=1920,
+        high_speed=10.0,
+        min_velocity_peak=8.0,
+        min_velocity_peak_mps=5.5,
+        high_speed_mps=6.5,
+        cooldown_frames=2,
+        pitch=pitch,
+    )
+    p1 = _player(1, 0, 400, 500)
+    p2 = _player(2, 0, 520, 500)  # ~120 px ≈ 12 m separation
+
+    for i in range(5):
+        det.update(i, (400, 510), 1.0, [p1, p2])
+
+    event = None
+    x = 400.0
+    frame = 5
+    # Creep at 3 px/frame — never clears pixel gates alone.
+    while x < 520 and event is None:
+        x += 3.0
+        frame += 1
+        near = [p1, p2] if x >= 505 else []
+        event = det.update(frame, (x, 510), 3.0, near, ball_observed=True)
+    settle = 0
+    while event is None and settle < 5:
+        frame += 1
+        settle += 1
+        event = det.update(frame, (min(x, 520.0), 510), 1.0, [p1, p2], ball_observed=True)
+
+    assert event is not None, (
+        f"expected meter-space pass; peak_px={det._peak_speed} peak_mps={det._peak_speed_mps}"
+    )
+    assert event.from_track_id == 1
+    assert event.to_track_id == 2
+    assert event.ball_speed_peak < det.min_velocity_peak
+    assert det.counts()["team0_passes"] == 1
+
+
+def test_stale_flight_aborts_without_receive():
+    """Orphan release must not leave the detector stuck in_flight forever."""
+    det = PassDetector(fps=30.0, frame_width=1920, max_flight_frames=60, cooldown_frames=2)
+    passer = [_player(1, 0, 400, 500)]
+
+    for i in range(5):
+        det.update(i, (400, 510), 2.0, passer)
+    # Force a release at high pixel speed with no receiver.
+    det.update(5, (450, 510), 20.0, [], ball_observed=True)
+    assert det._in_flight
+
+    # Advance past the stale-flight timeout with no successful receive.
+    for i in range(6, 6 + 70):
+        det.update(i, (450 + (i - 5), 510), 2.0, [], ball_observed=True)
+
+    assert not det._in_flight
+    assert det.counts()["team0_passes"] == 0
+
+
+def test_low_px_without_pitch_still_requires_pixel_peak():
+    """Pixel-only mode (pitch=None) must not accept a slow 3 px/frame transfer."""
+    det = PassDetector(
+        fps=30.0,
+        frame_width=1920,
+        high_speed=10.0,
+        min_velocity_peak=8.0,
+        cooldown_frames=2,
+        pitch=None,
+    )
+    p1 = _player(1, 0, 400, 500)
+    p2 = _player(2, 0, 520, 500)
+
+    for i in range(5):
+        det.update(i, (400, 510), 1.0, [p1, p2])
+
+    x = 400.0
+    frame = 5
+    event = None
+    while x < 520:
+        x += 3.0
+        frame += 1
+        near = [p1, p2] if x >= 505 else []
+        event = det.update(frame, (x, 510), 3.0, near, ball_observed=True)
+    if event is None:
+        frame += 1
+        event = det.update(frame, (520, 510), 1.0, [p1, p2], ball_observed=True)
+
+    assert event is None
+    assert det.counts()["team0_passes"] == 0
+
