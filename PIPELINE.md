@@ -10,7 +10,7 @@ Video clip
   → TeamColorAssigner (jersey KMeans)     # team 0 / team 1
   → Homography (calibration/*.json)       # pixel → pitch meters (105×68)
   → StatEngine
-       ├── possession (who's closest to ball)
+       ├── possession (hold last-touch team through a pass / short gap; idle = loose)
        ├── passes (geometry + speed/distance in meters)
        ├── shots + shots on target (pitch position + ball speed m/s)
        └── goals (goal-line crossing)
@@ -38,6 +38,8 @@ Saves `calibration/myclip.json`.
 ### 3. Run the full pipeline
 ```bash
 python run_clip.py --source input_videos/myclip.mp4 --no-cache --team0-name Morocco --team1-name France
+
+python scripts/evaluate_clip.py --source input_videos/elclasico.mp4 --gt evaluation/gt/elclasico.json
 ```
 
 ### 4. Outputs in `output_videos/`
@@ -48,10 +50,13 @@ python run_clip.py --source input_videos/myclip.mp4 --no-cache --team0-name Moro
 | `{clip}_stats_per_frame.csv` | Per-frame possession %, ball `x_m`/`y_m` |
 | `{clip}_pitch_tracks.csv` | Every player + ball position in **pitch meters** per frame |
 | `{clip}_frame_records.pkl` | Cached YOLO tracks (delete to re-detect) |
+| `{clip}_eval.mp4` | Player circles, ball boxes, HUD (from `evaluate_clip.py`) |
+| `{clip}_eval_report.txt` | Possession / pass / shot / goal summary |
 
 ## Stats included
 
-- **Possession** — % by team (jersey color clustering)
+- **Possession** — last-touch team keeps the ball through a pass until a stable interception; idle / pre-kickoff is loose
+- **Overlay** — ground ovals at players' feet + detector confidence; ball keeps a box
 - **Passes** — count + per-event `distance_m`, `speed_mps`, pitch coordinates
 - **Shots** — ball toward goal above speed threshold in attacking third
 - **Shots on target** — ball position inside goal mouth (7.32m wide)

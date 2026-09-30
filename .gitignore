@@ -41,7 +41,15 @@ output_videos/*
 # Large training datasets (keep scripts/docs only)
 training/soccer-players-1/
 training/labels/
+training/datasets/
+training/kaggle_upload/
 models/event_classifiers/
+
+# Local footage / extra clips (copyright + size)
+Leve_singlecam_clips/
+
+# Overnight eval dumps
+output_videos/overnight/
 
 # Local calibration can stay; ignore accidental dumps
 calibration/*.bak

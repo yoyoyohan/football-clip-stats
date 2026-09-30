@@ -1,92 +1,79 @@
-# Football Clip Stats Pipeline
+# Football Clip Stats
 
-End-to-end computer vision pipeline that turns a short broadcast football clip into match stats:
+Broadcast soccer clip → player/ball detections → tracks → team IDs → **possession, passes, shots, goals**.
 
-**possession · passes · shots · shots on target · goals**
+![Overlay demo](docs/demo.gif)
 
-Built with **YOLOv8 + ByteTrack**, jersey color clustering, pitch homography, and geometry-based event detection.
+YOLOv9c (5 classes) · ByteTrack · jersey KMeans · pitch homography (105×68 m) · geometry event engine.
 
-> **Note for reviewers:** Sample match videos and model weights are not in this repo (size + copyright). See setup below.
+Weights and match videos are **not** in git (size + copyright). Place `models/best.pt` locally. Training belongs on **Kaggle GPU**; clip analysis belongs **here**.
 
 ---
 
-## Architecture
+## Pipeline
 
 ```
-Video clip
-  → YOLO (models/best.pt) + ByteTrack     # players, ball, goalposts
-  → TeamColorAssigner (jersey KMeans)     # team 0 / team 1
-  → Homography (calibration/*.json)       # pixels → pitch meters (105×68)
+VIDEO
+  → YOLO (ball, player, goalkeeper, referee, goalpost)
+  → ByteTrack
+  → Team colors (torso KMeans)
+  → Homography
   → StatEngine
-       ├── possession
-       ├── passes (distance_m, speed_mps)
-       ├── shots + shots on target
+       ├── possession (hold through a pass until interception)
+       ├── passes
+       ├── shots / shots on target
        └── goals
+  → overlay + JSON/CSV report
 ```
+
+Players render as **ground ovals at the feet** (boxes stay internal). The ball keeps a bounding box.
 
 ## Quick start
 
 ```bash
-# 1. Install
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Add your detector weights
-#    Place trained YOLO weights at: models/best.pt
-#    (classes: ball, player, goalkeeper, referee, goalpost)
+# weights: models/best.pt
+# classes: ball, player, goalkeeper, referee, goalpost
 
-# 3. Add a short clip
-mkdir -p input_videos
-# copy your .mp4 into input_videos/
-
-# 4. Calibrate pitch (scrub video → click landmarks → save)
-python calibrate_pitch.py --source input_videos/yourclip.mp4
-# Full guide: CALIBRATION.md
-
-# 5. Run stats
 python run_clip.py --source input_videos/yourclip.mp4 --no-cache
+python scripts/evaluate_clip.py --source input_videos/yourclip.mp4 --gt evaluation/gt/elclasico.json
 ```
 
-Outputs land in `output_videos/`:
+| Output | What it is |
+| --- | --- |
+| `{clip}_stats.json` | Possession, passes, shots, goals, events in meters |
+| `{clip}_eval.mp4` | Overlay video (ovals, ball box, HUD) |
+| `{clip}_eval_report.txt` | Text summary vs optional ground truth |
 
-| File | Contents |
-|------|----------|
-| `{clip}_stats.json` | Passes, shots, SOT, goals, possession |
-| `{clip}_stats_per_frame.csv` | Possession + ball pitch coords |
-| `{clip}_pitch_tracks.csv` | Player/ball positions in meters |
+Pitch calibration: [CALIBRATION.md](CALIBRATION.md). Pipeline details: [PIPELINE.md](PIPELINE.md).
 
-## Project layout
+## What is reliable (today)
 
-```
-run_clip.py           # main CLI (detect → stats)
-calibrate_pitch.py    # interactive pitch calibration
-stats_engine.py       # possession / pass / shot / goal logic
-analysis/             # detectors, interpolator, team colors, pitch coords
-trackers/             # YOLO + ByteTrack wrapper
-utils/                # calibration, video I/O, goal regions
-training/             # Kaggle train notebooks + SoccerNet converter
-tests/                # unit tests
-CALIBRATION.md        # step-by-step calibration guide
-PIPELINE.md           # pipeline overview
-```
+- Player detection and tracking on broadcast clips
+- Team split when kits clearly differ
+- Pass *counts* on short clips **when the ball is visible**
+- A reproducible eval harness: same GT JSON, same script
 
-## Calibration
+## What is not
 
-Broadcast clips rarely show the full pitch. Calibration supports:
+- Ball recall on unseen wide-FOV footage (held-out Leve clips: ~5–40% of frames)
+- Possession/passes/shots when the ball is missing — stats collapse
+- Goalposts (few training examples)
+- Treating a 10-second demo as the generalization test
 
-- **`--mode goal`** — one goal visible (2 posts; default)
-- **`--mode landmarks`** — 4+ pitch marks when no goal is in frame
-- **`--mode corners`** — full pitch visible
+Held-out labels live in [`evaluation/gt/`](evaluation/gt/). Writeup: [`evaluation/REPORT.md`](evaluation/REPORT.md).
 
-See **[CALIBRATION.md](CALIBRATION.md)** for the full user flow.
+## Kaggle
 
-## Current limitations (honest)
+Use Kaggle **only** to fine-tune `best.pt` (SoccerNet is research-licensed; do not upload match video).
 
-- Accuracy depends heavily on **ball detection** quality
-- Tight midfield shots (no goal) weaken shot/goal geometry
-- Jersey clustering can skew possession on similar kits
-- Best on **short clips** (10–30s), not full matches yet
+- Notebooks: `training/kaggle_kernel/`
+- Local analysis: `run_clip.py` / `scripts/evaluate_clip.py`
+
+Publish an **inference** notebook (load weights from a Kaggle dataset, run a short clip, print stats). Keep training kernels as supporting material. Do not put SoccerNet frames or `best.pt` in this git repo.
 
 ## Tests
 
@@ -96,4 +83,4 @@ pytest -q
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — [LICENSE](LICENSE).

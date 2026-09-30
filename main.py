@@ -47,7 +47,7 @@ def main():
             frame_records = pickle.load(f)
     else:
         print(f"Running YOLO + tracking on {video_path} ({len(video_frames)} frames)...")
-        tracker = Tracker("models/best.pt")
+        tracker = Tracker("models/best.pt", fps=fps)
         frame_records = tracker.get_object_tracks(video_frames)
         track_cache.parent.mkdir(parents=True, exist_ok=True)
         slim = []

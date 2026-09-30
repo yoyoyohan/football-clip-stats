@@ -135,6 +135,36 @@ def test_pre_kickoff_players_no_ball_not_100(engine):
     assert poss.get("unknown_pct", 0.0) >= 99.0 or poss["loose_pct"] >= 99.0
 
 
+def test_possession_ignores_one_frame_flicker(engine):
+    """A single-frame closest-player swap must not flip team possession."""
+    team0 = _player(1, 0, 500, 500)
+    team1 = _player(2, 1, 530, 500)
+    ball = (500.0, 520.0)
+    for i in range(6):
+        engine.update(i, [team0, team1], ball)
+    flicker_ball = (530.0, 520.0)
+    engine.update(6, [team0, team1], flicker_ball)
+    for i in range(7, 12):
+        engine.update(i, [team0, team1], ball)
+    stats = engine.get_stats()
+    assert stats["possession"]["team0_pct"] > stats["possession"]["team1_pct"]
+    assert stats["possession"]["team1_pct"] == 0.0
+
+
+def test_possession_holds_through_pass_flight(engine):
+    """After a team touches the ball, in-flight / missing frames stay that team."""
+    team0 = _player(1, 0, 500, 500)
+    team1 = _player(2, 1, 900, 500)
+    ball = (500.0, 520.0)
+    for i in range(6):
+        engine.update(i, [team0, team1], ball, ball_observed=True)
+    for i in range(6, 16):
+        engine.update(i, [team0, team1], (700.0, 520.0), ball_observed=False)
+    stats = engine.get_stats()
+    assert stats["possession"]["team0_pct"] > 80.0
+    assert stats["possession"]["team1_pct"] == 0.0
+
+
 def test_loose_ball_visible_not_forced_to_team(engine):
     """Visible ball far from all players stays loose, not assigned 100%."""
     dets = [_player(1, 0, 200, 200), _player(2, 1, 1700, 900)]

@@ -24,7 +24,7 @@ class BallInterpolator:
     """
 
     REF_FPS = 30.0
-    MAX_GAP_AT_REF = 20
+    MAX_GAP_AT_REF = 36
     # ~900 px/s on a 1920×1080 frame ≈ fast on-screen kick; scaled by diagonal.
     REF_DIAG = math.hypot(1920.0, 1080.0)
     REF_MAX_SPEED_PX_S = 900.0

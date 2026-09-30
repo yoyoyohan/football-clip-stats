@@ -6,24 +6,57 @@ from utils.class_filter import (
     filter_supervision_detections,
     split_trackable_overlay,
 )
-from utils.detection_utils import detection_from_sv, extract_ball
+from utils.detection_utils import detection_from_sv, extract_ball, extract_coco_sports_ball
 from utils.goal_regions import detection_from_raw, extract_overlay
 
 
 class Tracker:
-    def __init__(self, model_path):
+    def __init__(
+        self,
+        model_path,
+        fps: float = 30.0,
+        device=None,
+        ball_fallback: bool = True,
+    ):
         self.model = YOLO(model_path)
-        self.tracker = sv.ByteTrack()
+        self.device = device
+        self.ball_fallback = ball_fallback
+        self._coco_ball_model = None
+        frame_rate = max(1, int(round(fps)))
+        # Keep ByteTrack; only scale the lost-track buffer to real video fps
+        # so ~1s of occlusion does not immediately drop an identity.
+        self.tracker = sv.ByteTrack(
+            frame_rate=frame_rate,
+            lost_track_buffer=max(30, frame_rate),
+        )
+
+    def _coco(self) -> YOLO:
+        if self._coco_ball_model is None:
+            self._coco_ball_model = YOLO("yolov8n.pt")
+        return self._coco_ball_model
 
     def detect_frames(self, frames):
         batch_size = 20
         detections = []
+        predict_kw = {"conf": 0.1, "verbose": False}
+        if self.device is not None:
+            predict_kw["device"] = self.device
         for i in range(0, len(frames), batch_size):
-            detections_batch = self.model.predict(
-                frames[i:i + batch_size], conf=0.1, verbose=False
-            )
+            detections_batch = self.model.predict(frames[i : i + batch_size], **predict_kw)
             detections += detections_batch
         return detections
+
+    def _fallback_ball(self, frame):
+        if not self.ball_fallback:
+            return None
+        kw = {"conf": 0.15, "verbose": False, "classes": [32]}
+        if self.device is not None:
+            kw["device"] = self.device
+        try:
+            result = self._coco().predict(frame, **kw)[0]
+        except Exception:
+            return None
+        return extract_coco_sports_ball(result)
 
     def get_object_tracks(self, frames):
         detections = self.detect_frames(frames)
@@ -55,6 +88,8 @@ class Tracker:
             # Ball from pre-track detections: ByteTrack often drops intermittent
             # small-object hits, which zeroed ball recall with newer weights.
             ball = extract_ball(trackable, cls_names_inv)
+            if ball is None:
+                ball = self._fallback_ball(frames[frame_num])
 
             detection_with_tracks = self.tracker.update_with_detections(trackable)
 

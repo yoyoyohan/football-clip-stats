@@ -1,0 +1,24 @@
+{
+  "video": "Leve_singlecam_clips/clip_09.mp4",
+  "verified": false,
+  "notes": "Watch this clip and replace nulls with numbers. team0 = Team A (brighter kit), team1 = Team B (darker kit). Use 100 not 100%. Leave null if you have not counted that stat yet. Source window ~5958.45s\u20135976.45s of Leve.mp4.",
+  "start_sec": 5958.45,
+  "end_sec": 5976.45,
+  "batch": 1,
+  "possession": {
+    "team0_pct": null,
+    "team1_pct": null
+  },
+  "passes": {
+    "team0": null,
+    "team1": null
+  },
+  "shots": {
+    "team0": null,
+    "team1": null
+  },
+  "goals": {
+    "team0": null,
+    "team1": null
+  }
+}

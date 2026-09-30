@@ -175,7 +175,7 @@ def main():
             frame_records = pickle.load(f)
     else:
         print(f"Detecting with {args.model} ({len(video_frames)} frames)...")
-        tracker = Tracker(args.model)
+        tracker = Tracker(args.model, fps=fps)
         raw = tracker.get_object_tracks(video_frames)
         frame_records = [
             {

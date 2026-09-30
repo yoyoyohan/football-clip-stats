@@ -1,0 +1,21 @@
+{
+  "video": "input_videos/elclasico.mp4",
+  "verified": true,
+  "notes": "Short El Clásico demo, sanity check only. The team that completed the passes kept the ball the whole clip (no interception), so possession is 100% that team. HUD currently labels them team1. JSON numbers cannot use a % sign — use 100, not 100%.",
+  "possession": {
+    "team0_pct": 0,
+    "team1_pct": 100
+  },
+  "passes": {
+    "team0": 4,
+    "team1": 0
+  },
+  "shots": {
+    "team0": 0,
+    "team1": 0
+  },
+  "goals": {
+    "team0": 0,
+    "team1": 0
+  }
+}

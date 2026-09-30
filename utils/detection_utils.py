@@ -65,3 +65,39 @@ def extract_ball(det, class_names_inv: dict) -> dict | None:
                 "bbox": [x1, y1, x2, y2],
             }
     return best
+
+
+def extract_coco_sports_ball(result, *, max_frac: float = 0.008, min_px: float = 4.0) -> dict | None:
+    """Best COCO 'sports ball' box that is small enough to be a soccer ball."""
+    names = getattr(result, "names", {}) or {}
+    inv = {str(v).lower(): int(k) for k, v in names.items()}
+    ball_id = inv.get("sports ball", inv.get("ball"))
+    if ball_id is None or result.boxes is None or len(result.boxes) == 0:
+        return None
+    orig = getattr(result, "orig_shape", None)
+    frame_area = float(orig[0] * orig[1]) if orig is not None else 1920.0 * 1080.0
+    max_area = max_frac * frame_area
+    best = None
+    best_conf = -1.0
+    xyxy = result.boxes.xyxy.cpu().numpy()
+    cls = result.boxes.cls.cpu().numpy()
+    conf = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else None
+    for i, cid in enumerate(cls):
+        if int(cid) != ball_id:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in xyxy[i])
+        w, h = x2 - x1, y2 - y1
+        area = max(0.0, w * h)
+        if min(w, h) < min_px or area > max_area:
+            continue
+        c = float(conf[i]) if conf is not None else 0.0
+        if c > best_conf:
+            best_conf = c
+            best = {
+                "position": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                "confidence": c,
+                "area": area,
+                "bbox": [x1, y1, x2, y2],
+                "source": "coco_sports_ball",
+            }
+    return best

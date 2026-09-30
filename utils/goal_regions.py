@@ -22,6 +22,12 @@ def detection_from_raw(
         tid = det.tracker_id[index]
         if tid is not None:
             track_id = int(tid)
+    confidence = None
+    if getattr(det, "confidence", None) is not None:
+        try:
+            confidence = float(det.confidence[index])
+        except (TypeError, IndexError, ValueError):
+            confidence = None
     return {
         "track_id": track_id,
         "class_id": class_id,
@@ -29,6 +35,7 @@ def detection_from_raw(
         "bbox": bbox,
         "cx": float(cx),
         "cy": float(cy),
+        "confidence": confidence,
         "team_id": None,
         "is_goalkeeper": class_name in {
             "goalkeeper",

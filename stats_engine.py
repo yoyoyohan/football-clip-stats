@@ -114,6 +114,8 @@ class StatEngine:
     SAVE_VELOCITY = 20.0
     GK_SAVE_FRAMES = 15
     HEATMAP_BIN = 20
+    # Require a short dwell before a new closest-player becomes possessor.
+    POSSESSION_CONFIRM_SEC = 0.12
 
     def __init__(
         self,
@@ -151,6 +153,9 @@ class StatEngine:
         self._ball_present_frames = 0
         self._controlled_possession_frames = 0
         self._no_ball_streak = 0
+        self._candidate_track_id: int | None = None
+        self._candidate_team: int | None = None
+        self._candidate_streak = 0
 
         self.pass_detector = PassDetector(
             fps=fps,
@@ -251,21 +256,51 @@ class StatEngine:
             return best
         return None
 
+    def _reset_possession_candidate(self) -> None:
+        self._candidate_track_id = None
+        self._candidate_team = None
+        self._candidate_streak = 0
+
     def _ball_speed(self) -> float:
         vel = _velocity_px(self._ball_history)
         return float(np.linalg.norm(vel))
 
-    def _update_possession(self, frame_idx: int, players: list[dict], ball: tuple[float, float] | None):
-        # Idle / empty / missing-ball frames stay "loose" (unknown). Do not keep
-        # crediting the last touch team forever — that produced 100% on pre-kickoff.
-        if ball is None:
+    def _credit_last_team(self) -> bool:
+        if self._last_touch_team is None:
+            return False
+        key = f"team{self._last_touch_team}"
+        if key not in self._possession_frames:
+            return False
+        self._possession_frames[key] += 1
+        self._controlled_possession_frames += 1
+        self._possessor_team = self._last_touch_team
+        return True
+
+    def _update_possession(
+        self,
+        frame_idx: int,
+        players: list[dict],
+        ball: tuple[float, float] | None,
+        ball_observed: bool = True,
+    ):
+        # A completed touch stays with that team through a pass / short occlusion
+        # until the other team stably receives (interception). Idle with no
+        # prior touch is still loose — that is pre-kickoff, not a pass.
+        if ball is None or not ball_observed:
             self._no_ball_streak += 1
+            hold_frames = max(8, int(self.fps * 1.5))
+            if self._last_touch_team is not None and self._no_ball_streak <= hold_frames:
+                self._credit_last_team()
+                self._reset_possession_candidate()
+                return
             self._possession_frames["loose"] += 1
-            # After a short occlusion grace (~0.4s), clear active possessor.
-            if self._no_ball_streak > max(3, int(self.fps * 0.4)):
+            self._reset_possession_candidate()
+            if self._no_ball_streak > hold_frames:
                 self._check_dribble_end(frame_idx, False)
                 self._possessor_track_id = None
                 self._possessor_team = None
+                if self._no_ball_streak > max(hold_frames * 2, int(self.fps * 4)):
+                    self._last_touch_team = None
             return
 
         self._no_ball_streak = 0
@@ -274,17 +309,52 @@ class StatEngine:
         owner = self._closest_player_to_ball(players, ball)
         prev_track = self._possessor_track_id
         prev_team = self._possessor_team
+        confirm = max(1, int(round(self.fps * self.POSSESSION_CONFIRM_SEC)))
 
         if owner is None:
-            # Ball visible but not controlled — count as loose, not last-team inherit.
+            # Ball in flight / not at anyone's feet — still the last-touch team
+            # until someone else stably receives.
+            if self._credit_last_team():
+                self._possessor_track_id = None
+                self._reset_possession_candidate()
+                return
             self._possession_frames["loose"] += 1
             self._check_dribble_end(frame_idx, False)
             self._possessor_track_id = None
             self._possessor_team = None
+            self._reset_possession_candidate()
             return
 
         team = owner["team_id"]
         track_id = owner["track_id"]
+
+        if prev_track is None:
+            if self._candidate_track_id == track_id:
+                self._candidate_streak += 1
+            else:
+                self._candidate_track_id = track_id
+                self._candidate_team = team
+                self._candidate_streak = 1
+            if self._candidate_streak < confirm:
+                self._possession_frames["loose"] += 1
+                return
+        elif track_id != prev_track:
+            if self._candidate_track_id == track_id:
+                self._candidate_streak += 1
+            else:
+                self._candidate_track_id = track_id
+                self._candidate_team = team
+                self._candidate_streak = 1
+            if self._candidate_streak < confirm:
+                # Hold previous team until the new owner is stable.
+                key = f"team{prev_team}" if prev_team is not None else None
+                if key in self._possession_frames:
+                    self._possession_frames[key] += 1
+                    self._controlled_possession_frames += 1
+                else:
+                    self._possession_frames["loose"] += 1
+                return
+        self._reset_possession_candidate()
         key = f"team{team}"
         self._possession_frames[key] += 1
         self._controlled_possession_frames += 1
@@ -592,7 +662,7 @@ class StatEngine:
             self.speed_estimator.update(tid, center)
             self._update_sprints(tid, center)
 
-        self._update_possession(frame_idx, players, ball)
+        self._update_possession(frame_idx, players, ball, ball_observed=ball_observed)
         speed = self._ball_speed() if ball is not None else 0.0
         speed_mps = 0.0
         vx_sign = 0.0
